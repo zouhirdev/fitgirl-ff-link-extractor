@@ -95,6 +95,11 @@ class FitgirlExtractorApp:
         
         self.extract_btn = ttk.Button(controls_frame, text="2. Extract Selected", command=self.start_extraction_thread, state="disabled")
         self.extract_btn.pack(side="right", padx=2)
+        
+        self.browser_var = tk.StringVar(value="Auto-Detect Browser")
+        self.browser_combo = ttk.Combobox(controls_frame, textvariable=self.browser_var, state="readonly", width=18)
+        self.browser_combo['values'] = ("Auto-Detect Browser", "Mozilla Firefox", "Google Chrome", "Microsoft Edge")
+        self.browser_combo.pack(side="right", padx=(5, 10))
 
         # 4. Progress Bar
         self.progress = ttk.Progressbar(
@@ -251,20 +256,34 @@ class FitgirlExtractorApp:
 
     # --- Step 2: Extraction ---
 
-    def get_browser_path(self):
-        """Finds the first available Chromium browser on the system."""
-        browser_paths = [
-            r"%ProgramFiles%\Google\Chrome\Application\chrome.exe",
-            r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe",
-            r"%LocalAppData%\Google\Chrome\Application\chrome.exe",
-            r"%ProgramFiles%\BraveSoftware\Brave-Browser\Application\brave.exe",
-            r"%ProgramFiles(x86)%\BraveSoftware\Brave-Browser\Application\brave.exe",
-            r"%LocalAppData%\BraveSoftware\Brave-Browser\Application\brave.exe",
-            r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe",
-            r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe",
-            r"%LocalAppData%\Microsoft\Edge\Application\msedge.exe"
-        ]
-        for path in browser_paths:
+    def get_browser_path(self, selected_browser="Auto-Detect Browser"):
+        """Finds the browser based on user selection or auto-detect."""
+        browser_paths = {
+            "Google Chrome": [
+                r"%ProgramFiles%\Google\Chrome\Application\chrome.exe",
+                r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe",
+                r"%LocalAppData%\Google\Chrome\Application\chrome.exe"
+            ],
+            "Microsoft Edge": [
+                r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe",
+                r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe",
+                r"%LocalAppData%\Microsoft\Edge\Application\msedge.exe"
+            ],
+            "Mozilla Firefox": [
+                r"%ProgramFiles%\Mozilla Firefox\firefox.exe",
+                r"%ProgramFiles(x86)%\Mozilla Firefox\firefox.exe",
+                r"%LocalAppData%\Mozilla Firefox\firefox.exe"
+            ]
+        }
+        
+        if selected_browser != "Auto-Detect Browser":
+            paths_to_check = browser_paths.get(selected_browser, [])
+        else:
+            paths_to_check = []
+            for paths in browser_paths.values():
+                paths_to_check.extend(paths)
+
+        for path in paths_to_check:
             expanded_path = os.path.expandvars(path)
             if os.path.exists(expanded_path):
                 return expanded_path
@@ -289,9 +308,10 @@ class FitgirlExtractorApp:
         total = len(links)
         
         # 1. Discover the best browser automatically
-        browser_executable = self.get_browser_path()
+        selected_browser = self.browser_var.get()
+        browser_executable = self.get_browser_path(selected_browser)
         if not browser_executable:
-            self.root.after(0, self.update_ui, "Error: Could not find Chrome, Brave, or Edge on your system.")
+            self.root.after(0, self.update_ui, f"Error: Could not find {selected_browser} on your system.")
             self.root.after(0, lambda: self.fetch_btn.config(state="normal"))
             self.root.after(0, lambda: self.extract_btn.config(state="normal"))
             return
@@ -301,13 +321,22 @@ class FitgirlExtractorApp:
         
         # Helper function to generate driver safely
         def create_driver(version=None):
-            opts = uc.ChromeOptions()
-            return uc.Chrome(
-                options=opts, 
-                use_subprocess=True, 
-                browser_executable_path=browser_executable, 
-                version_main=version
-            )
+            if browser_name.lower() == 'firefox':
+                from selenium import webdriver
+                from selenium.webdriver.firefox.options import Options
+                opts = Options()
+                opts.binary_location = browser_executable
+                opts.set_preference("dom.webdriver.enabled", False)
+                opts.set_preference("useAutomationExtension", False)
+                return webdriver.Firefox(options=opts)
+            else:
+                opts = uc.ChromeOptions()
+                return uc.Chrome(
+                    options=opts, 
+                    use_subprocess=True, 
+                    browser_executable_path=browser_executable, 
+                    version_main=version
+                )
         
         try:
             # 2. Chrome Driver Auto-Version Logic
@@ -315,7 +344,7 @@ class FitgirlExtractorApp:
                 driver = create_driver()
             except Exception as e:
                 error_msg = str(e)
-                if "Current browser version is" in error_msg:
+                if browser_name.lower() != 'firefox' and "Current browser version is" in error_msg:
                     # Extract the major version number the user ACTUALLY has installed
                     match = re.search(r"Current browser version is (\d+)", error_msg)
                     if match:
@@ -335,11 +364,16 @@ class FitgirlExtractorApp:
                 
                 try:
                     driver.get(link)
-                    time.sleep(4)  # Wait for Cloudflare Turnstile
                     
-                    match = re.search(r'window\.open\("([^"]+)"\)', driver.page_source)
-                    if match:
-                        direct_url = match.group(1)
+                    direct_url = None
+                    for _ in range(25):  # Dynamic wait up to 25 seconds for Turnstile
+                        time.sleep(1)
+                        match = re.search(r'window\.open\("([^"]+)"\)', driver.page_source)
+                        if match:
+                            direct_url = match.group(1)
+                            break
+                            
+                    if direct_url:
                         self.root.after(0, self.update_ui, None, i, None, direct_url)
                     else:
                         self.root.after(0, self.update_ui, None, i, None, f"# FAILED: {filename} ({link})")
