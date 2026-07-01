@@ -1,15 +1,24 @@
-import setuptools  # Register distutils fallback
-import os
 import tkinter as tk
 from tkinter import ttk, messagebox
 import threading
-import time
 import re
 import requests
 from bs4 import BeautifulSoup
-import undetected_chromedriver as uc
+from seleniumbase import SB
 
 class FitgirlExtractorApp:
+    BROWSER_CHOICES = (
+        "Auto-Detect Browser",
+        "Google Chrome",
+        "Microsoft Edge",
+        "Brave",
+    )
+    SELENIUMBASE_BROWSERS = {
+        "Google Chrome": "chrome",
+        "Microsoft Edge": "edge",
+        "Brave": "brave",
+    }
+
     def __init__(self, root):
         self.root = root
         self.root.title("FitGirl FF Link Extractor (Pro)")
@@ -97,13 +106,7 @@ class FitgirlExtractorApp:
         self.extract_btn.pack(side="right", padx=2)
         self.browser_var = tk.StringVar(value="Auto-Detect Browser")
         self.browser_combo = ttk.Combobox(controls_frame, textvariable=self.browser_var, state="readonly", width=18)
-        self.browser_combo['values'] = (
-                    "Auto-Detect Browser", 
-                    "Google Chrome", 
-                    "Microsoft Edge", 
-                    "Brave", 
-                    "Mozilla Firefox"
-                )
+        self.browser_combo['values'] = self.BROWSER_CHOICES
         self.browser_combo.pack(side="right", padx=(5, 10))
 
         # 4. Progress Bar
@@ -265,58 +268,19 @@ class FitgirlExtractorApp:
 
 
     # --- Step 2: Extraction ---
-    def get_browser_path(self, selected_browser="Auto-Detect Browser"):
-        import sys
-        
-        # Check if running on Linux / Steam Deck
-        is_linux = sys.platform.startswith('linux')
-        
-        browser_paths = {
-            "Google Chrome": [
-                r"%ProgramFiles%\Google\Chrome\Application\chrome.exe",
-                r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe",
-                r"%LocalAppData%\Google\Chrome\Application\chrome.exe",
-                "/usr/bin/google-chrome",
-                "/usr/bin/google-chrome-stable",
-                "/var/lib/flatpak/exports/bin/com.google.Chrome" # Common Steam Deck Flatpak path
-            ],
-            "Microsoft Edge": [
-                r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe",
-                r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe",
-                r"%LocalAppData%\Microsoft\Edge\Application\msedge.exe",
-                "/usr/bin/microsoft-edge-stable",
-                "/usr/bin/microsoft-edge"
-            ],
-            "Brave": [
-                r"%ProgramFiles%\BraveSoftware\Brave-Browser\Application\brave.exe",
-                r"%ProgramFiles(x86)%\BraveSoftware\Brave-Browser\Application\brave.exe",
-                r"%LocalAppData%\BraveSoftware\Brave-Browser\Application\brave.exe",
-                "/usr/bin/brave-browser",
-                "/usr/bin/brave",
-                "/var/lib/flatpak/exports/bin/com.brave.Browser" # Common Steam Deck Flatpak path
-            ],
-            "Mozilla Firefox": [
-                r"%ProgramFiles%\Mozilla Firefox\firefox.exe",
-                r"%ProgramFiles(x86)%\Mozilla Firefox\firefox.exe",
-                r"%LocalAppData%\Mozilla Firefox\firefox.exe",
-                "/usr/bin/firefox",
-                "/var/lib/flatpak/exports/bin/org.mozilla.firefox"
-            ]
+    def get_seleniumbase_options(self, selected_browser):
+        options = {
+            "uc": True,
+            "headless": True,
+            "locale": "en-US",
+            "window_size": "1280,900",
         }
-        
-        if selected_browser != "Auto-Detect Browser":
-            paths_to_check = browser_paths.get(selected_browser, [])
-        else:
-            paths_to_check = []
-            for paths in browser_paths.values():
-                paths_to_check.extend(paths)
 
-        for path in paths_to_check:
-            # os.path.expandvars handles the Windows % variables, safely ignores Linux ones
-            expanded_path = os.path.expandvars(path)
-            if os.path.exists(expanded_path):
-                return expanded_path
-        return None
+        browser = self.SELENIUMBASE_BROWSERS.get(selected_browser)
+        if browser:
+            options["browser"] = browser
+
+        return options
     
 
     def start_extraction_thread(self):
@@ -334,110 +298,51 @@ class FitgirlExtractorApp:
         thread.start()
 
     def run_extraction(self, links):
-        driver = None
         total = len(links)
         
-        # 1. Discover the best browser automatically
         selected_browser = self.browser_var.get()
-        browser_executable = self.get_browser_path(selected_browser)
-        if not browser_executable:
-            self.root.after(0, self.update_ui, f"Error: Could not find {selected_browser} on your system.")
-            self.root.after(0, lambda: self.fetch_btn.config(state="normal"))
-            self.root.after(0, lambda: self.extract_btn.config(state="normal"))
-            return
-
-        browser_name = os.path.basename(browser_executable).replace('.exe', '')
-        self.root.after(0, self.update_ui, f"Initializing using {browser_name} to bypass Cloudflare...", 0, total)
-        
-        # Helper function to generate driver safely
-        def create_driver(version=None):
-            if browser_name.lower() == 'firefox':
-                from selenium import webdriver
-                from selenium.webdriver.firefox.options import Options
-                opts = Options()
-                opts.binary_location = browser_executable
-                opts.set_preference("dom.webdriver.enabled", False)
-                opts.set_preference("useAutomationExtension", False)
-                return webdriver.Firefox(options=opts)
-                
-            elif browser_name.lower() == 'msedge':
-                from selenium import webdriver
-                from selenium.webdriver.edge.options import Options
-                opts = Options()
-                opts.binary_location = browser_executable
-                # Basic stealth for standard Edge driver
-                opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-                opts.add_experimental_option('useAutomationExtension', False)
-                opts.add_argument("--disable-blink-features=AutomationControlled")
-                return webdriver.Edge(options=opts)
-                
-            else:
-                # Chrome and Brave use the powerful undetected-chromedriver
-                opts = uc.ChromeOptions()
-                return uc.Chrome(
-                    options=opts, 
-                    use_subprocess=True, 
-                    browser_executable_path=browser_executable, 
-                    version_main=version
-                )
+        browser_display = (
+            "SeleniumBase default browser"
+            if selected_browser == "Auto-Detect Browser"
+            else selected_browser
+        )
+        self.root.after(0, self.update_ui, f"Initializing headless SeleniumBase CDP with {browser_display}...", 0, total)
         
         try:
-            # 2. Driver Auto-Version Logic
-            try:
-                driver = create_driver()
-            except Exception as e:
-                error_msg = str(e)
-                # Only apply the uc.Chrome auto-version fix to Chrome/Brave
-                if browser_name.lower() not in ['firefox', 'msedge'] and "Current browser version is" in error_msg:
-                    # Extract the major version number the user ACTUALLY has installed
-                    match = re.search(r"Current browser version is (\d+)", error_msg)
-                    if match:
-                        correct_version = int(match.group(1))
-                        self.root.after(0, self.update_ui, f"Auto-fixing ChromeDriver version to v{correct_version}...")
-                        driver = create_driver(version=correct_version)
-                    else:
-                        raise e # Re-raise if regex fails
-                else:
-                    raise e # Re-raise if it's a different error
-            # ---------------------------------------
+            with SB(**self.get_seleniumbase_options(selected_browser)) as driver:
+                # Dynamic wait logic from PR
+                for i, link in enumerate(links, 1):
+                    filename = link.split('#')[-1] if '#' in link else link.split('/')[-1]
+                    self.root.after(0, self.update_ui, f"Processing [{i}/{total}]: {filename}")
 
-            # Dynamic wait logic from PR
-            for i, link in enumerate(links, 1):
-                filename = link.split('#')[-1] if '#' in link else link.split('/')[-1]
-                self.root.after(0, self.update_ui, f"Processing [{i}/{total}]: {filename}")
-                
-                try:
-                    driver.get(link)
-                    
-                    direct_url = None
-                    for _ in range(25):  # Dynamic wait up to 25 seconds for Turnstile
-                        time.sleep(1)
-                        match = re.search(r'window\.open\("([^"]+)"\)', driver.page_source)
-                        if match:
-                            direct_url = match.group(1)
-                            break
-                            
-                    if direct_url:
-                        self.root.after(0, self.update_ui, None, i, None, direct_url)
-                    else:
-                        self.root.after(0, self.update_ui, None, i, None, f"# FAILED: {filename} ({link})")
-                        
-                except Exception as e:
-                    self.root.after(0, self.update_ui, None, i, None, f"# ERROR: {str(e)} -> {filename}")
+                    try:
+                        driver.activate_cdp_mode(link)
+
+                        direct_url = None
+                        for _ in range(25):  # Dynamic wait up to 25 seconds for Turnstile
+                            driver.sleep(1)
+                            page_source = driver.get_page_source()
+                            match = re.search(r'window\.open\("([^"]+)"\)', page_source)
+                            if match:
+                                direct_url = match.group(1)
+                                break
+
+                        if direct_url:
+                            self.root.after(0, self.update_ui, None, i, None, direct_url)
+                        else:
+                            self.root.after(0, self.update_ui, None, i, None, f"# FAILED: {filename} ({link})")
+
+                    except Exception as e:
+                        self.root.after(0, self.update_ui, None, i, None, f"# ERROR: {str(e)} -> {filename}")
 
             self.root.after(0, self.update_ui, f"Extraction complete! Processed {total} links.")
-            
+
         except Exception as e:
             self.root.after(0, self.update_ui, f"Critical Error: {str(e)}")
             
         finally:
             self.root.after(0, lambda: self.fetch_btn.config(state="normal"))
             self.root.after(0, lambda: self.extract_btn.config(state="normal"))
-            if driver:
-                try:
-                    driver.quit()
-                except:
-                    pass
 
 if __name__ == "__main__":
     root = tk.Tk()

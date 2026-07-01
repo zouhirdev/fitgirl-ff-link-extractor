@@ -5,7 +5,7 @@ A lightweight, threaded desktop GUI tool built in Python to retrieve, filter, an
 ## Features
 - **Fast Parsing:** Instantly pulls files, setup binaries, and optional parts.
 - **Selective Scrape:** Use checkboxes to exclude unwanted files (like bonus content, other languages, etc.) before running the slow browser extraction process.
-- **Cloudflare Bypass:** Employs an undetected browser process to seamlessly pass Turnstile checks.
+- **Headless SeleniumBase CDP:** Uses SeleniumBase UC + CDP mode with headless mode for the browser extraction step.
 - **Copy-to-Clipboard:** One button copies all successfully resolved direct URLs for direct import into JDownloader 2, IDM, or Free Download Manager.
 
 ## Download (Pre-compiled Executable)
@@ -20,7 +20,7 @@ If you prefer to run the raw Python code:
    ```
 2. Set up your environment and install dependencies:
    ```bash
-   pip install -r requirements.txt
+   python -m pip install -r requirements.txt
    ```
 3. Run the script:
    ```bash
