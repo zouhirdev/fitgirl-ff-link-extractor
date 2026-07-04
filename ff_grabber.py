@@ -424,33 +424,33 @@ class FitgirlExtractorApp:
                         match_new = re.search(r'hx-post="([^"]+)"', page_html)
                         if match_new:
                             post_endpoint = match_new.group(1)
-                            post_url = f"https://fuckingfast.co{post_endpoint}"
-                            
-                            # Grab Cloudflare clearance cookies from the browser
-                            cookies = {c['name']: c['value'] for c in driver.get_cookies()}
-                            headers = {
-                                "User-Agent": driver.execute_script("return navigator.userAgent;"),
-                                "HX-Request": "true"
-                            }
-                            
-                            # Fire the POST request to get the redirect URL
+
+                            # Fire the POST request FROM INSIDE THE BROWSER (via fetch),
+                            # not via `requests`. Cloudflare fingerprints the TLS/HTTP
+                            # client itself, so a Python-side request gets a 403 even
+                            # with valid cookies copied over.
+                            fetch_script = """
+                                const callback = arguments[arguments.length - 1];
+                                fetch(arguments[0], {
+                                    method: 'POST',
+                                    headers: {'HX-Request': 'true'},
+                                    redirect: 'manual'
+                                }).then(res => callback({
+                                    status: res.status,
+                                    headers: Object.fromEntries(res.headers.entries())
+                                })).catch(e => callback({error: String(e)}));
+                            """
                             try:
-                                res = requests.post(post_url, cookies=cookies, headers=headers, allow_redirects=False)
-                                
-                                # Intercept the redirect Location
-                                if 'HX-Redirect' in res.headers:
-                                    direct_url = res.headers['HX-Redirect']
-                                    break
-                                elif 'Location' in res.headers:
-                                    direct_url = res.headers['Location']
-                                    break
-                                elif res.status_code == 200:
-                                    # Just in case it returns the URL in plain text
-                                    match_url = re.search(r'(https://dl\.fuckingfast\.co/dl/[^\'"]+)', res.text)
-                                    if match_url:
-                                        direct_url = match_url.group(1)
+                                result = driver.execute_async_script(fetch_script, post_endpoint)
+                                if result and not result.get('error'):
+                                    res_headers = {k.lower(): v for k, v in result.get('headers', {}).items()}
+                                    if 'hx-redirect' in res_headers:
+                                        direct_url = res_headers['hx-redirect']
                                         break
-                            except:
+                                    elif 'location' in res_headers:
+                                        direct_url = res_headers['location']
+                                        break
+                            except Exception:
                                 pass # Keep trying if network blips
                             
                     if direct_url:
