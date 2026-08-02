@@ -8,6 +8,7 @@ import re
 import requests
 from bs4 import BeautifulSoup
 import undetected_chromedriver as uc
+from selenium.webdriver.common.by import By
 
 class FitgirlExtractorApp:
     def __init__(self, root):
@@ -410,6 +411,12 @@ class FitgirlExtractorApp:
                     driver.get(link)
                     
                     direct_url = None
+                    clicked_htmx = False
+                    ad_popup_closed = False
+                    htmx_click_count = 0
+                    first_click_time = None
+                    original_handle = driver.current_window_handle
+                    original_handles = set(driver.window_handles)
                     for _ in range(25):  # Dynamic wait up to 25 seconds for Turnstile
                         time.sleep(1)
                         page_html = driver.page_source
@@ -420,38 +427,111 @@ class FitgirlExtractorApp:
                             direct_url = match_old.group(1)
                             break
                             
-                        # NEW METHOD: Check for the HTMX post button
-                        match_new = re.search(r'hx-post="([^"]+)"', page_html)
-                        if match_new:
-                            post_endpoint = match_new.group(1)
-                            post_url = f"https://fuckingfast.co{post_endpoint}"
-                            
-                            # Grab Cloudflare clearance cookies from the browser
-                            cookies = {c['name']: c['value'] for c in driver.get_cookies()}
-                            headers = {
-                                "User-Agent": driver.execute_script("return navigator.userAgent;"),
-                                "HX-Request": "true"
-                            }
-                            
-                            # Fire the POST request to get the redirect URL
+                        # Keep the HTMX POST inside Chrome so its Cloudflare
+                        # cookies, browser fingerprint, and session state remain intact.
+                        if not clicked_htmx:
                             try:
-                                res = requests.post(post_url, cookies=cookies, headers=headers, allow_redirects=False)
-                                
-                                # Intercept the redirect Location
-                                if 'HX-Redirect' in res.headers:
-                                    direct_url = res.headers['HX-Redirect']
+                                button_ready = bool(driver.execute_script(r"""
+                                    const button = document.querySelector('button[hx-post], [hx-post]');
+                                    if (!button || !window.htmx) return false;
+
+                                    window.__ffDirectUrl = null;
+                                    document.body.addEventListener('htmx:afterRequest', function capture(event) {
+                                        const xhr = event.detail && event.detail.xhr;
+                                        if (!xhr) return;
+                                        window.__ffDirectUrl =
+                                            xhr.getResponseHeader('HX-Redirect') ||
+                                            xhr.getResponseHeader('Location') ||
+                                            (/https:\/\/dl\.fuckingfast\.co\/dl\/[^'\"\\s<]+/
+                                                .exec(xhr.responseText || '') || [])[0] ||
+                                            ((xhr.responseURL || '').includes('/dl/')
+                                                ? xhr.responseURL : null);
+                                    }, {once: true});
+
+                                    button.scrollIntoView({block: 'center'});
+                                    return true;
+                                """))
+                                if button_ready:
+                                    # WebElement.click() produces a real browser input
+                                    # event; a JavaScript button.click() can be rejected
+                                    # by popup/download handlers as synthetic input.
+                                    driver.find_element(
+                                        By.CSS_SELECTOR, 'button[hx-post], [hx-post]'
+                                    ).click()
+                                    clicked_htmx = True
+                                if clicked_htmx:
+                                    htmx_click_count += 1
+                                    if htmx_click_count == 1:
+                                        first_click_time = time.time()
+                            except Exception:
+                                # A successful click can immediately navigate away,
+                                # making execute_script itself lose the page context.
+                                clicked_htmx = True
+                                htmx_click_count += 1
+                                if htmx_click_count == 1:
+                                    first_click_time = time.time()
+
+                        if clicked_htmx:
+                            try:
+                                captured_url = driver.execute_script(
+                                    "return window.__ffDirectUrl || null;"
+                                )
+                                if captured_url and captured_url != link:
+                                    direct_url = captured_url
                                     break
-                                elif 'Location' in res.headers:
-                                    direct_url = res.headers['Location']
+                            except Exception:
+                                pass
+
+                            # HTMX may navigate the current tab or open a new one.
+                            try:
+                                new_handles = set(driver.window_handles) - original_handles
+                                if new_handles:
+                                    # FuckingFast commonly consumes the first click
+                                    # with an advertising tab. Close it, return to the
+                                    # original page, and let the next iteration click
+                                    # the real download button a second time.
+                                    if htmx_click_count == 1:
+                                        for popup_handle in new_handles:
+                                            driver.switch_to.window(popup_handle)
+                                            driver.close()
+                                        driver.switch_to.window(original_handle)
+                                        ad_popup_closed = True
+                                        clicked_htmx = False
+                                        continue
+
+                                    driver.switch_to.window(new_handles.pop())
+                                browser_url = driver.current_url
+                                if browser_url and browser_url != link and (
+                                    '/dl/' in browser_url or
+                                    browser_url.startswith('https://dl.fuckingfast.co')
+                                ):
+                                    direct_url = browser_url
                                     break
-                                elif res.status_code == 200:
-                                    # Just in case it returns the URL in plain text
-                                    match_url = re.search(r'(https://dl\.fuckingfast\.co/dl/[^\'"]+)', res.text)
-                                    if match_url:
-                                        direct_url = match_url.group(1)
-                                        break
-                            except:
-                                pass # Keep trying if network blips
+                            except Exception:
+                                try:
+                                    driver.switch_to.window(original_handle)
+                                except Exception:
+                                    pass
+
+                            # Some browsers block the advertising popup entirely,
+                            # so there is no new window handle to signal that the
+                            # first click was consumed. Always perform a second
+                            # click after giving the first click a moment to settle.
+                            if (
+                                htmx_click_count == 1 and
+                                first_click_time is not None and
+                                time.time() - first_click_time >= 2
+                            ):
+                                try:
+                                    for popup_handle in set(driver.window_handles) - original_handles:
+                                        driver.switch_to.window(popup_handle)
+                                        driver.close()
+                                    driver.switch_to.window(original_handle)
+                                except Exception:
+                                    pass
+                                ad_popup_closed = True
+                                clicked_htmx = False
+                                continue
                             
                     if direct_url:
                         self.root.after(0, self.update_ui, None, i, None, direct_url)
