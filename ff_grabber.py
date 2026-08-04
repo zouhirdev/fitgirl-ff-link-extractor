@@ -105,6 +105,8 @@ class FitgirlExtractorApp:
                     "Mozilla Firefox"
                 )
         self.browser_combo.pack(side="right", padx=(5, 10))
+        self.verbose_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(controls_frame, text="Verbose", variable=self.verbose_var).pack(side="right", padx=(5, 0))
 
         # 4. Progress Bar
         self.progress = ttk.Progressbar(
@@ -199,6 +201,12 @@ class FitgirlExtractorApp:
         if text_append is not None:
             self.text_area.insert(tk.END, text_append + "\n")
             self.text_area.see(tk.END)
+
+    def log_verbose(self, message):
+        """Append a diagnostic line to the output area when Verbose is enabled."""
+        if self.verbose_var.get():
+            self.root.after(0, self.update_ui, None, None, None, f"# {message}")
+            print(f"[verbose] {message}", flush=True)
 
 
     # --- Step 1: Fetching Links ---
@@ -333,146 +341,409 @@ class FitgirlExtractorApp:
         thread = threading.Thread(target=self.run_extraction, args=(selected_links,), daemon=True)
         thread.start()
 
+    def extract_direct_with_curl_cffi(self, page_url):
+        """Fast path: resolve via curl_cffi Chrome impersonation (often blocked by CF JS)."""
+        from urllib.parse import urljoin
+        from curl_cffi import requests as cffi_requests
+
+        base = page_url.split("#", 1)[0]
+        session = cffi_requests.Session(impersonate="chrome")
+        response = session.get(page_url, timeout=20)
+        if response.status_code != 200:
+            return None, f"page GET HTTP {response.status_code}"
+
+        html = response.text
+        if "Just a moment" in html or "cf-challenge" in html.lower():
+            return None, "Cloudflare JS challenge page (curl_cffi cannot solve it)"
+
+        match_old = re.search(r'window\.open\("(https://dl\.fuckingfast\.co/dl/[^"]+)"\)', html)
+        if match_old:
+            return match_old.group(1), None
+
+        htmx_match = re.search(r'hx-(?:post|get)="([^"]+)"', html)
+        if not htmx_match:
+            return None, "no hx-post/get in page HTML"
+
+        endpoint_path = htmx_match.group(1)
+        is_get = htmx_match.group(0).lower().startswith("hx-get")
+        endpoint_url = urljoin(page_url, endpoint_path)
+        headers = {
+            "HX-Request": "true",
+            "HX-Current-URL": base,
+            "Referer": base,
+            "Origin": "https://fuckingfast.co",
+        }
+        if is_get:
+            api_resp = session.get(endpoint_url, headers=headers, timeout=20, allow_redirects=False)
+        else:
+            api_resp = session.post(endpoint_url, headers=headers, timeout=20, allow_redirects=False)
+
+        direct_link = (
+            api_resp.headers.get("hx-redirect")
+            or api_resp.headers.get("HX-Redirect")
+            or api_resp.headers.get("location")
+            or api_resp.headers.get("Location")
+        )
+        if not direct_link and api_resp.text:
+            dl_match = re.search(r'(https://dl\.fuckingfast\.co/dl/[^"\s\'<>]+)', api_resp.text)
+            if dl_match:
+                direct_link = dl_match.group(1)
+
+        if direct_link:
+            return direct_link, None
+        return None, f"/go returned HTTP {api_resp.status_code}; body={api_resp.text[:80]!r}"
+
+    def _install_ff_hooks(self, driver):
+        """Capture /go HX-Redirect and suppress ad popups (FitFast-style)."""
+        driver.execute_script(
+            """
+            window.open = function(){ return null; };
+            window.__ff = {url: null, status: null, body: null, clicks: 0};
+            if (!window.__ffHookInstalled) {
+                window.__ffHookInstalled = true;
+                const capture = (xhr) => {
+                    try {
+                        const redir = xhr.getResponseHeader('HX-Redirect')
+                            || xhr.getResponseHeader('hx-redirect')
+                            || xhr.getResponseHeader('Location');
+                        window.__ff.status = xhr.status;
+                        window.__ff.body = (xhr.responseText || '').slice(0, 300);
+                        if (redir) window.__ff.url = redir;
+                    } catch (e) {}
+                };
+                const origOpen = XMLHttpRequest.prototype.open;
+                XMLHttpRequest.prototype.open = function(method, url) {
+                    this.__ffUrl = url;
+                    this.addEventListener('load', function() {
+                        if (String(this.__ffUrl || '').includes('/go')) capture(this);
+                    });
+                    return origOpen.apply(this, arguments);
+                };
+                document.addEventListener('htmx:afterRequest', function(evt) {
+                    try { if (evt.detail && evt.detail.xhr) capture(evt.detail.xhr); } catch (e) {}
+                });
+                document.addEventListener('htmx:beforeOnLoad', function(evt) {
+                    try {
+                        const redir = evt.detail.xhr.getResponseHeader('HX-Redirect')
+                            || evt.detail.xhr.getResponseHeader('hx-redirect');
+                        if (redir) {
+                            window.__ff.url = redir;
+                            window.__ff.status = evt.detail.xhr.status;
+                            evt.detail.shouldSwap = false;
+                        }
+                    } catch (e) {}
+                });
+            }
+            """
+        )
+
+    def _capture_from_performance_logs(self, driver):
+        """Fallback: scrape Chrome performance logs for hx-redirect on /go."""
+        try:
+            import json
+            for entry in driver.get_log("performance"):
+                try:
+                    msg = json.loads(entry["message"])["message"]
+                except Exception:
+                    continue
+                if msg.get("method") != "Network.responseReceived":
+                    continue
+                params = msg.get("params") or {}
+                resp = params.get("response") or {}
+                url = resp.get("url") or ""
+                if "/go" not in url or "/f/" not in url:
+                    continue
+                headers = {str(k).lower(): v for k, v in (resp.get("headers") or {}).items()}
+                redir = headers.get("hx-redirect") or headers.get("location")
+                if redir:
+                    return redir
+        except Exception:
+            pass
+        return None
+
+    def extract_direct_with_browser(self, driver, link, index, total):
+        """FitFast flow: load page, click download twice, capture hx-redirect."""
+        self.log_verbose(f"[{index}/{total}] Opening in browser: {link}")
+        driver.get(link)
+
+        try:
+            driver.execute_cdp_cmd(
+                "Page.setDownloadBehavior",
+                {"behavior": "deny", "downloadPath": "/tmp"},
+            )
+        except Exception:
+            pass
+
+        # Give Cloudflare passive JS challenge time to finish.
+        time.sleep(2.5)
+
+        button_ready = False
+        for attempt in range(30):
+            page_html = driver.page_source
+            match_old = re.search(r'window\.open\("(https://dl\.fuckingfast\.co/dl/[^"]+)"\)', page_html)
+            if match_old:
+                self.log_verbose(f"[{index}/{total}] Found window.open URL")
+                return match_old.group(1), None
+
+            has_btn = driver.execute_script(
+                "return !!document.querySelector('a.link-button, [hx-post*=\"/go\"], [hx-get*=\"/go\"]');"
+            )
+            if has_btn:
+                button_ready = True
+                break
+
+            if attempt % 5 == 0:
+                try:
+                    title = driver.title
+                except Exception:
+                    title = None
+                cf_hint = "just a moment" in page_html.lower() or "turnstile" in page_html.lower()
+                self.log_verbose(
+                    f"[{index}/{total}] Waiting for download button (attempt {attempt + 1}/30)"
+                    f"{f', title={title!r}' if title else ''}"
+                    f"{' [possible CF]' if cf_hint else ''}"
+                )
+            time.sleep(1)
+
+        if not button_ready:
+            return None, "download button never appeared (Cloudflare or page change?)"
+
+        self._install_ff_hooks(driver)
+        self.log_verbose(f"[{index}/{total}] Clicking a.link-button twice (FitFast flow)")
+
+        # First click often fires an ad/popup; second click triggers /go.
+        for click_num in (1, 2):
+            clicked = driver.execute_script(
+                """
+                const el = document.querySelector('a.link-button')
+                    || document.querySelector('[hx-post*="/go"], [hx-get*="/go"], [hx-post], [hx-get]');
+                if (!el) return false;
+                el.click();
+                window.__ff.clicks = (window.__ff.clicks || 0) + 1;
+                return true;
+                """
+            )
+            if not clicked:
+                return None, f"click {click_num}: download button not found"
+            self.log_verbose(f"[{index}/{total}] Click {click_num} OK")
+            if click_num == 1:
+                time.sleep(1.2)
+
+        deadline = time.time() + 20
+        last_status = None
+        last_body = None
+        while time.time() < deadline:
+            try:
+                current = driver.current_url or ""
+            except Exception:
+                current = ""
+            if "dl.fuckingfast.co" in current:
+                self.log_verbose(f"[{index}/{total}] Captured via navigation")
+                return current.split("#", 1)[0], None
+
+            info = driver.execute_script("return window.__ff || null;")
+            if isinstance(info, dict):
+                if info.get("url"):
+                    self.log_verbose(
+                        f"[{index}/{total}] Captured via XHR/HTMX (status={info.get('status')})"
+                    )
+                    return info["url"], None
+                if info.get("status") not in (None, 0):
+                    last_status = info.get("status")
+                    last_body = info.get("body")
+
+            perf_url = self._capture_from_performance_logs(driver)
+            if perf_url:
+                self.log_verbose(f"[{index}/{total}] Captured via performance log")
+                return perf_url, None
+
+            time.sleep(0.25)
+
+        if last_status is not None:
+            return None, f"after double-click /go -> HTTP {last_status}; body={last_body!r}"
+        return None, "double-clicked download but no hx-redirect within 20s"
+
+    def _create_browser_driver(self, browser_executable, browser_name, version=None):
+        if browser_name.lower() == "firefox":
+            from selenium import webdriver
+            from selenium.webdriver.firefox.options import Options
+            opts = Options()
+            opts.binary_location = browser_executable
+            opts.set_preference("dom.webdriver.enabled", False)
+            opts.set_preference("useAutomationExtension", False)
+            return webdriver.Firefox(options=opts)
+
+        if browser_name.lower() == "msedge":
+            from selenium import webdriver
+            from selenium.webdriver.edge.options import Options
+            opts = Options()
+            opts.binary_location = browser_executable
+            opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+            opts.add_experimental_option("useAutomationExtension", False)
+            opts.add_argument("--disable-blink-features=AutomationControlled")
+            opts.set_capability("ms:loggingPrefs", {"performance": "ALL"})
+            return webdriver.Edge(options=opts)
+
+        opts = uc.ChromeOptions()
+        opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+        return uc.Chrome(
+            options=opts,
+            use_subprocess=True,
+            browser_executable_path=browser_executable,
+            version_main=version,
+        )
+
     def run_extraction(self, links):
         driver = None
         total = len(links)
-        
-        # 1. Discover the best browser automatically
-        selected_browser = self.browser_var.get()
-        browser_executable = self.get_browser_path(selected_browser)
-        if not browser_executable:
-            self.root.after(0, self.update_ui, f"Error: Could not find {selected_browser} on your system.")
-            self.root.after(0, lambda: self.fetch_btn.config(state="normal"))
-            self.root.after(0, lambda: self.extract_btn.config(state="normal"))
-            return
+        verbose = self.verbose_var.get()
 
-        browser_name = os.path.basename(browser_executable).replace('.exe', '')
-        self.root.after(0, self.update_ui, f"Initializing using {browser_name} to bypass Cloudflare...", 0, total)
-        
-        # Helper function to generate driver safely
-        def create_driver(version=None):
-            if browser_name.lower() == 'firefox':
-                from selenium import webdriver
-                from selenium.webdriver.firefox.options import Options
-                opts = Options()
-                opts.binary_location = browser_executable
-                opts.set_preference("dom.webdriver.enabled", False)
-                opts.set_preference("useAutomationExtension", False)
-                return webdriver.Firefox(options=opts)
-                
-            elif browser_name.lower() == 'msedge':
-                from selenium import webdriver
-                from selenium.webdriver.edge.options import Options
-                opts = Options()
-                opts.binary_location = browser_executable
-                # Basic stealth for standard Edge driver
-                opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-                opts.add_experimental_option('useAutomationExtension', False)
-                opts.add_argument("--disable-blink-features=AutomationControlled")
-                return webdriver.Edge(options=opts)
-                
-            else:
-                # Chrome and Brave use the powerful undetected-chromedriver
-                opts = uc.ChromeOptions()
-                return uc.Chrome(
-                    options=opts, 
-                    use_subprocess=True, 
-                    browser_executable_path=browser_executable, 
-                    version_main=version
-                )
-        
         try:
-            # 2. Driver Auto-Version Logic
+            # curl_cffi is a fast path only. Current CF often requires a real
+            # browser double-click (FitFast flow); fall back immediately on failure.
+            cffi_ok = False
             try:
-                driver = create_driver()
+                import curl_cffi  # noqa: F401
+                cffi_ok = True
+            except ImportError:
+                cffi_ok = False
+
+            remaining = list(enumerate(links, 1))
+            if cffi_ok:
+                self.root.after(
+                    0, self.update_ui, "Trying curl_cffi fast path (1 probe)...", 0, total
+                )
+                probe_link = links[0]
+                self.log_verbose(f"Probing curl_cffi with: {probe_link}")
+                try:
+                    probe_url, probe_err = self.extract_direct_with_curl_cffi(probe_link)
+                except Exception as e:
+                    probe_url, probe_err = None, f"{type(e).__name__}: {e}"
+
+                if probe_url:
+                    # Fast path works — resolve everything with curl_cffi.
+                    self.log_verbose("curl_cffi probe OK — using it for all links")
+                    self.root.after(0, self.update_ui, None, 1, None, probe_url)
+                    remaining = []
+                    for i, link in enumerate(links[1:], 2):
+                        filename = link.split("#")[-1] if "#" in link else link.split("/")[-1]
+                        self.root.after(0, self.update_ui, f"Processing [{i}/{total}]: {filename}")
+                        self.log_verbose(f"[{i}/{total}] curl_cffi: {link}")
+                        try:
+                            direct_url, err = self.extract_direct_with_curl_cffi(link)
+                        except Exception as e:
+                            direct_url, err = None, f"{type(e).__name__}: {e}"
+                        if direct_url:
+                            self.root.after(0, self.update_ui, None, i, None, direct_url)
+                        else:
+                            self.log_verbose(f"[{i}/{total}] curl_cffi miss: {err}")
+                            remaining.append((i, link))
+                        time.sleep(0.5)
+                    if not remaining:
+                        self.root.after(
+                            0, self.update_ui, f"Extraction complete! Processed {total} links."
+                        )
+                        return
+                    self.log_verbose(
+                        f"Falling back to browser for {len(remaining)} remaining link(s)"
+                    )
+                else:
+                    self.log_verbose(
+                        f"curl_cffi probe failed ({probe_err}); "
+                        "using browser double-click for all links"
+                    )
+                    remaining = list(enumerate(links, 1))
+
+            selected_browser = self.browser_var.get()
+            browser_executable = self.get_browser_path(selected_browser)
+            if not browser_executable:
+                self.root.after(
+                    0,
+                    self.update_ui,
+                    f"Error: Could not find {selected_browser} on your system.",
+                )
+                for i, link in remaining:
+                    filename = link.split("#")[-1] if "#" in link else link.split("/")[-1]
+                    self.root.after(
+                        0, self.update_ui, None, i, None, f"# FAILED: {filename} ({link})"
+                    )
+                return
+
+            browser_name = os.path.basename(browser_executable).replace(".exe", "")
+            self.root.after(
+                0,
+                self.update_ui,
+                f"Browser resolve via {browser_name} (double-click download)...",
+                0,
+                total,
+            )
+            self.log_verbose(f"Using browser FitFast-style flow with {browser_name}")
+
+            try:
+                driver = self._create_browser_driver(browser_executable, browser_name)
             except Exception as e:
                 error_msg = str(e)
-                # Only apply the uc.Chrome auto-version fix to Chrome/Brave
-                if browser_name.lower() not in ['firefox', 'msedge'] and "Current browser version is" in error_msg:
-                    # Extract the major version number the user ACTUALLY has installed
+                if (
+                    browser_name.lower() not in ["firefox", "msedge"]
+                    and "Current browser version is" in error_msg
+                ):
                     match = re.search(r"Current browser version is (\d+)", error_msg)
                     if match:
                         correct_version = int(match.group(1))
-                        self.root.after(0, self.update_ui, f"Auto-fixing ChromeDriver version to v{correct_version}...")
-                        driver = create_driver(version=correct_version)
+                        self.root.after(
+                            0,
+                            self.update_ui,
+                            f"Auto-fixing ChromeDriver version to v{correct_version}...",
+                        )
+                        driver = self._create_browser_driver(
+                            browser_executable, browser_name, version=correct_version
+                        )
                     else:
-                        raise e # Re-raise if regex fails
+                        raise
                 else:
-                    raise e # Re-raise if it's a different error
-            # ---------------------------------------
+                    raise
 
-            # Dynamic wait logic from PR
-            for i, link in enumerate(links, 1):
-                filename = link.split('#')[-1] if '#' in link else link.split('/')[-1]
+            for i, link in remaining:
+                filename = link.split("#")[-1] if "#" in link else link.split("/")[-1]
                 self.root.after(0, self.update_ui, f"Processing [{i}/{total}]: {filename}")
-                
                 try:
-                    driver.get(link)
-                    
-                    direct_url = None
-                    for _ in range(25):  # Dynamic wait up to 25 seconds for Turnstile
-                        time.sleep(1)
-                        page_html = driver.page_source
-                        
-                        # Fallback: Check if they reverted to the old window.open method
-                        match_old = re.search(r'window\.open\("([^"]+)"\)', page_html)
-                        if match_old:
-                            direct_url = match_old.group(1)
-                            break
-                            
-                        # NEW METHOD: Check for the HTMX post button
-                        match_new = re.search(r'hx-post="([^"]+)"', page_html)
-                        if match_new:
-                            post_endpoint = match_new.group(1)
-                            post_url = f"https://fuckingfast.co{post_endpoint}"
-                            
-                            # Grab Cloudflare clearance cookies from the browser
-                            cookies = {c['name']: c['value'] for c in driver.get_cookies()}
-                            headers = {
-                                "User-Agent": driver.execute_script("return navigator.userAgent;"),
-                                "HX-Request": "true"
-                            }
-                            
-                            # Fire the POST request to get the redirect URL
-                            try:
-                                res = requests.post(post_url, cookies=cookies, headers=headers, allow_redirects=False)
-                                
-                                # Intercept the redirect Location
-                                if 'HX-Redirect' in res.headers:
-                                    direct_url = res.headers['HX-Redirect']
-                                    break
-                                elif 'Location' in res.headers:
-                                    direct_url = res.headers['Location']
-                                    break
-                                elif res.status_code == 200:
-                                    # Just in case it returns the URL in plain text
-                                    match_url = re.search(r'(https://dl\.fuckingfast\.co/dl/[^\'"]+)', res.text)
-                                    if match_url:
-                                        direct_url = match_url.group(1)
-                                        break
-                            except:
-                                pass # Keep trying if network blips
-                            
+                    direct_url, err = self.extract_direct_with_browser(driver, link, i, total)
                     if direct_url:
                         self.root.after(0, self.update_ui, None, i, None, direct_url)
                     else:
-                        self.root.after(0, self.update_ui, None, i, None, f"# FAILED: {filename} ({link})")
-                        
+                        self.root.after(
+                            0,
+                            self.update_ui,
+                            None,
+                            i,
+                            None,
+                            f"# FAILED: {filename} ({link})",
+                        )
+                        if verbose:
+                            self.log_verbose(f"[{i}/{total}] FAIL detail: {err}")
                 except Exception as e:
-                    self.root.after(0, self.update_ui, None, i, None, f"# ERROR: {str(e)} -> {filename}")
+                    self.root.after(
+                        0,
+                        self.update_ui,
+                        None,
+                        i,
+                        None,
+                        f"# ERROR: {str(e)} -> {filename}",
+                    )
+                    self.log_verbose(f"[{i}/{total}] Exception: {type(e).__name__}: {e}")
 
             self.root.after(0, self.update_ui, f"Extraction complete! Processed {total} links.")
-            
+
         except Exception as e:
             self.root.after(0, self.update_ui, f"Critical Error: {str(e)}")
-            
+
         finally:
             self.root.after(0, lambda: self.fetch_btn.config(state="normal"))
             self.root.after(0, lambda: self.extract_btn.config(state="normal"))
             if driver:
                 try:
                     driver.quit()
-                except:
+                except Exception:
                     pass
 
 if __name__ == "__main__":

@@ -2,3 +2,5 @@ setuptools
 requests
 beautifulsoup4
 undetected-chromedriver
+curl_cffi
+selenium
