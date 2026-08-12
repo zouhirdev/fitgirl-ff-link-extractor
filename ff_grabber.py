@@ -410,46 +410,63 @@ class FitgirlExtractorApp:
                     driver.get(link)
                     
                     direct_url = None
-                    for _ in range(25):  # Dynamic wait up to 25 seconds for Turnstile
+                    for _ in range(30):  
                         time.sleep(1)
                         page_html = driver.page_source
                         
-                        # Fallback: Check if they reverted to the old window.open method
+                        # Fallback: Old window.open method
                         match_old = re.search(r'window\.open\("([^"]+)"\)', page_html)
                         if match_old:
                             direct_url = match_old.group(1)
                             break
                             
-                        # NEW METHOD: Check for the HTMX post button
+                        # NEW METHOD: HTMX Post Button
                         match_new = re.search(r'hx-post="([^"]+)"', page_html)
                         if match_new:
-                            post_endpoint = match_new.group(1)
-                            post_url = f"https://fuckingfast.co{post_endpoint}"
-                            
-                            # Grab Cloudflare clearance cookies from the browser
-                            cookies = {c['name']: c['value'] for c in driver.get_cookies()}
-                            headers = {
-                                "User-Agent": driver.execute_script("return navigator.userAgent;"),
-                                "HX-Request": "true"
-                            }
-                            
-                            # Fire the POST request to get the redirect URL
-                            try:
-                                res = requests.post(post_url, cookies=cookies, headers=headers, allow_redirects=False)
+                            # 1. Wait for Cloudflare to generate the Turnstile Token
+                            turnstile_token = driver.execute_script("return window.turnstileToken;")
+                            if not turnstile_token:
+                                continue  # Token isn't ready yet, keep waiting
                                 
-                                # Intercept the redirect Location
-                                if 'HX-Redirect' in res.headers:
-                                    direct_url = res.headers['HX-Redirect']
-                                    break
-                                elif 'Location' in res.headers:
-                                    direct_url = res.headers['Location']
-                                    break
-                                elif res.status_code == 200:
-                                    # Just in case it returns the URL in plain text
-                                    match_url = re.search(r'(https://dl\.fuckingfast\.co/dl/[^\'"]+)', res.text)
-                                    if match_url:
-                                        direct_url = match_url.group(1)
+                            post_endpoint = match_new.group(1)
+                            
+                            # 2. Run the POST request INSIDE the browser using native JS fetch!
+                            # This bypasses the ad-click requirement and uses Chrome's own network stack 
+                            # so Cloudflare's TLS fingerprinting cannot block it.
+                            js_fetch = f"""
+                            var callback = arguments[0];
+                            fetch('{post_endpoint}', {{
+                                method: 'POST',
+                                headers: {{
+                                    'HX-Request': 'true',
+                                    'Content-Type': 'application/x-www-form-urlencoded'
+                                }},
+                                body: 'cf-turnstile-response=' + encodeURIComponent(window.turnstileToken)
+                            }}).then(response => {{
+                                let redirectUrl = response.headers.get('hx-redirect') || response.headers.get('location');
+                                if (redirectUrl) {{
+                                    callback(redirectUrl);
+                                }} else {{
+                                    response.text().then(t => callback(t));
+                                }}
+                            }}).catch(e => callback("ERROR"));
+                            """
+                            
+                            # Allow async script to wait for the fetch to resolve
+                            driver.set_script_timeout(10)
+                            try:
+                                result = driver.execute_async_script(js_fetch)
+                                
+                                if result:
+                                    if result.startswith("http"):
+                                        direct_url = result
                                         break
+                                    else:
+                                        # If the server returned HTML text with the link instead of a redirect header
+                                        match_url = re.search(r'(https://dl\.fuckingfast\.co/dl/[^\'"]+)', result)
+                                        if match_url:
+                                            direct_url = match_url.group(1)
+                                            break
                             except:
                                 pass # Keep trying if network blips
                             
