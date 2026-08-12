@@ -2,8 +2,8 @@ name: Build Windows EXE
 
 on:
   push:
-    branches: [ main ]  # Will build every time you push to main
-  workflow_dispatch:    # Allows you to trigger it manually from the GitHub website
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -11,10 +11,10 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4  # Updated to v4
 
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5 # Updated to v5
       with:
         python-version: '3.11'
 
@@ -28,7 +28,7 @@ jobs:
         pyinstaller --onefile --noconsole --name="FitGirl_FF_Link_Extractor" ff_grabber.py
 
     - name: Upload EXE Artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4 # Updated to v4
       with:
         name: FitGirl_FF_Link_Extractor-Windows
         path: dist/FitGirl_FF_Link_Extractor.exe
