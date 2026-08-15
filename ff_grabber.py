@@ -377,8 +377,9 @@ class FitgirlExtractorApp:
                 from selenium.webdriver.firefox.options import Options
                 opts = Options()
                 opts.binary_location = browser_executable
+                # geckodriver exposes navigator.webdriver regardless of these
+                # preferences, so Cloudflare can still detect the session
                 opts.set_preference("dom.webdriver.enabled", False)
-                opts.set_preference("useAutomationExtension", False)
                 return webdriver.Firefox(options=opts)
                 
             elif browser_name.lower() == 'msedge':
@@ -457,7 +458,19 @@ class FitgirlExtractorApp:
             # ---------------------------------------
             diag(f"DRIVER READY: {type(driver).__module__}.{type(driver).__name__}")
 
+            # Firefox and Edge drive the browser through plain Selenium, which
+            # always exposes navigator.webdriver. Cloudflare sees that and never
+            # issues a Turnstile token, no matter how often the widget is clicked.
+            detectable_browser = browser_name.lower() in ('firefox', 'msedge')
+            captcha_blocked = 0
+            resolved_any = False
+            if detectable_browser:
+                self.root.after(0, self.update_ui,
+                    f"Warning: Cloudflare can detect automation in {browser_name} and may refuse the captcha. "
+                    f"Google Chrome or Brave is recommended.")
+
             def extract_one(drv, link, filename):
+                nonlocal captcha_blocked
                 ensure_window(drv)
                 drv.get(link)
 
@@ -563,6 +576,10 @@ class FitgirlExtractorApp:
                 diag(f"RESOLVE TIMEOUT {filename}: title={title!r} cf_challenge={is_cf_challenge} "
                      f"hx_post_seen={saw_hx_post} turnstile_token={'set' if last_token else repr(last_token)} "
                      f"html_len={len(last_html)}")
+                # Counts both an unsolved captcha on the file page and the full
+                # "Just a moment..." interstitial Cloudflare escalates to
+                if is_cf_challenge and not last_token:
+                    captcha_blocked += 1
                 return None
 
             for i, link in enumerate(links, 1):
@@ -573,6 +590,7 @@ class FitgirlExtractorApp:
                     try:
                         direct_url = extract_one(driver, link, filename)
                         if direct_url:
+                            resolved_any = True
                             self.root.after(0, self.update_ui, None, i, None, direct_url)
                         else:
                             self.root.after(0, self.update_ui, None, i, None, f"# FAILED: {filename} ({link})")
@@ -591,7 +609,20 @@ class FitgirlExtractorApp:
                         self.root.after(0, self.update_ui, None, i, None, f"# ERROR: {str(e)} -> {filename}")
                         break
 
-            self.root.after(0, self.update_ui, f"Extraction complete! Processed {total} links.")
+                # Stop early instead of spending a minute per link on a browser
+                # Cloudflare will keep rejecting for the whole run
+                if detectable_browser and captcha_blocked >= 2 and not resolved_any:
+                    diag(f"ABORT: Cloudflare never issued a token in {browser_name} after {captcha_blocked} links")
+                    self.root.after(0, self.update_ui,
+                        f"Cloudflare is rejecting {browser_name}: the captcha never completes for an automated "
+                        f"{browser_name} window. Use Google Chrome or Brave instead.")
+                    self.root.after(0, self.update_ui, None, None, None,
+                        f"# STOPPED after {i} links: Cloudflare would not verify {browser_name}. "
+                        f"Re-run with Google Chrome or Brave.")
+                    break
+
+            else:
+                self.root.after(0, self.update_ui, f"Extraction complete! Processed {total} links.")
             
         except Exception as e:
             diag(f"CRITICAL ERROR: {e}", exc=True)
