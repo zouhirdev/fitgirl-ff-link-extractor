@@ -1,5 +1,22 @@
 import setuptools  # Register distutils fallback
 import os
+import traceback
+import datetime
+
+# --- TEMP DIAGNOSTICS (remove after debugging) ---
+DIAG_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "diagnostics.log")
+
+def diag(msg, exc=False):
+    line = f"[{datetime.datetime.now():%H:%M:%S}] {msg}"
+    if exc:
+        line += "\n" + traceback.format_exc()
+    print(line, flush=True)
+    try:
+        with open(DIAG_LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+# --------------------------------------------------
 import tkinter as tk
 from tkinter import ttk, messagebox
 import threading
@@ -8,6 +25,8 @@ import re
 import requests
 from bs4 import BeautifulSoup
 import undetected_chromedriver as uc
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.action_chains import ActionChains
 
 class FitgirlExtractorApp:
     def __init__(self, root):
@@ -240,6 +259,7 @@ class FitgirlExtractorApp:
             self.root.after(0, self.update_ui, "Network Error: Cannot reach FitGirl. Is your ISP blocking it? Try a VPN/Custom DNS.")
             self.root.after(0, lambda: self.fetch_btn.config(state="normal"))
         except Exception as e:
+            diag(f"FETCH ERROR: {e}", exc=True)
             self.root.after(0, self.update_ui, f"Error fetching links: {str(e)}")
             self.root.after(0, lambda: self.fetch_btn.config(state="normal"))
 
@@ -347,6 +367,7 @@ class FitgirlExtractorApp:
             return
 
         browser_name = os.path.basename(browser_executable).replace('.exe', '')
+        diag(f"EXTRACTION START: {total} links, browser={selected_browser} -> {browser_executable}")
         self.root.after(0, self.update_ui, f"Initializing using {browser_name} to bypass Cloudflare...", 0, total)
         
         # Helper function to generate driver safely
@@ -356,8 +377,9 @@ class FitgirlExtractorApp:
                 from selenium.webdriver.firefox.options import Options
                 opts = Options()
                 opts.binary_location = browser_executable
+                # geckodriver exposes navigator.webdriver regardless of these
+                # preferences, so Cloudflare can still detect the session
                 opts.set_preference("dom.webdriver.enabled", False)
-                opts.set_preference("useAutomationExtension", False)
                 return webdriver.Firefox(options=opts)
                 
             elif browser_name.lower() == 'msedge':
@@ -381,11 +403,44 @@ class FitgirlExtractorApp:
                     version_main=version
                 )
         
+        def ensure_window(drv):
+            # Reattach to a surviving window and keep a spare blank tab open,
+            # so a site closing its own window can't take the whole browser down
+            handles = drv.window_handles
+            if not handles:
+                raise RuntimeError("all browser windows closed")
+            try:
+                drv.current_window_handle
+            except Exception:
+                drv.switch_to.window(handles[-1])
+            if len(drv.window_handles) < 2:
+                try:
+                    drv.execute_script("window.open('about:blank','_blank');")
+                except Exception:
+                    pass
+
+        def session_is_dead(err):
+            msg = str(err)
+            return any(s in msg for s in (
+                "invalid session id",
+                "browser has closed",
+                "not connected to DevTools",
+                "no such window",
+                "web view not found",
+                "chrome not reachable",
+                "unable to connect to renderer",
+                "Tried to run command without establishing a connection",
+                "Browsing context has been discarded",
+                "Failed to decode response from marionette",
+            ))
+
+        working_version = None
         try:
             # 2. Driver Auto-Version Logic
             try:
                 driver = create_driver()
             except Exception as e:
+                diag(f"DRIVER CREATE ERROR ({browser_name}): {e}", exc=True)
                 error_msg = str(e)
                 # Only apply the uc.Chrome auto-version fix to Chrome/Brave
                 if browser_name.lower() not in ['firefox', 'msedge'] and "Current browser version is" in error_msg:
@@ -393,6 +448,7 @@ class FitgirlExtractorApp:
                     match = re.search(r"Current browser version is (\d+)", error_msg)
                     if match:
                         correct_version = int(match.group(1))
+                        working_version = correct_version
                         self.root.after(0, self.update_ui, f"Auto-fixing ChromeDriver version to v{correct_version}...")
                         driver = create_driver(version=correct_version)
                     else:
@@ -400,87 +456,176 @@ class FitgirlExtractorApp:
                 else:
                     raise e # Re-raise if it's a different error
             # ---------------------------------------
+            diag(f"DRIVER READY: {type(driver).__module__}.{type(driver).__name__}")
 
-            # Dynamic wait logic from PR
+            # Firefox and Edge drive the browser through plain Selenium, which
+            # always exposes navigator.webdriver. Cloudflare sees that and never
+            # issues a Turnstile token, no matter how often the widget is clicked.
+            detectable_browser = browser_name.lower() in ('firefox', 'msedge')
+            captcha_blocked = 0
+            resolved_any = False
+            if detectable_browser:
+                self.root.after(0, self.update_ui,
+                    f"Warning: Cloudflare can detect automation in {browser_name} and may refuse the captcha. "
+                    f"Google Chrome or Brave is recommended.")
+
+            def extract_one(drv, link, filename):
+                nonlocal captcha_blocked
+                ensure_window(drv)
+                drv.get(link)
+
+                last_html = ""
+                saw_hx_post = False
+                last_token = None
+                clicked_widget = False
+                for tick in range(60):
+                    time.sleep(1)
+                    page_html = drv.page_source
+                    last_html = page_html
+
+                    # Fallback: Old window.open method
+                    match_old = re.search(r'window\.open\("([^"]+)"\)', page_html)
+                    if match_old:
+                        return match_old.group(1)
+
+                    # NEW METHOD: HTMX Post Button
+                    match_new = re.search(r'hx-post="([^"]+)"', page_html)
+                    if match_new:
+                        saw_hx_post = True
+                        # 1. Wait for Cloudflare to generate the Turnstile Token.
+                        # Check both the JS variable the site sets in its callback and
+                        # the hidden input Turnstile fills in directly on success.
+                        turnstile_token = drv.execute_script(
+                            "return window.turnstileToken"
+                            " || (document.querySelector('[name=\"cf-turnstile-response\"]') || {}).value"
+                            " || null;")
+                        last_token = turnstile_token
+                        if not turnstile_token:
+                            if 'data-sitekey' in page_html:
+                                # A Turnstile widget is on the page and unsolved.
+                                # Its managed checkbox often needs a real click
+                                # before Cloudflare will issue a token.
+                                if not clicked_widget and tick >= 2:
+                                    clicked_widget = True
+                                    try:
+                                        el = drv.find_element(By.ID, "cf-turnstile")
+                                        drv.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                                        ActionChains(drv).move_to_element_with_offset(
+                                            el, 30 - el.size['width'] // 2, 0).click().perform()
+                                        diag(f"Clicked Turnstile widget for {filename}")
+                                    except Exception as click_err:
+                                        diag(f"Turnstile widget click failed: {click_err}")
+                                if tick == 10:
+                                    self.root.after(0, self.update_ui,
+                                        "Cloudflare check pending — if a captcha checkbox is visible in the browser window, please click it")
+                                continue  # Token isn't ready yet, keep waiting
+                            # No Turnstile widget on this page: the session is already
+                            # cleared, so the button POSTs without a token.
+                            turnstile_token = ""
+
+                        post_endpoint = match_new.group(1)
+
+                        # 2. Run the POST request INSIDE the browser using native JS fetch!
+                        # This bypasses the ad-click requirement and uses Chrome's own network stack
+                        # so Cloudflare's TLS fingerprinting cannot block it.
+                        js_fetch = """
+                        var token = arguments[0];
+                        var endpoint = arguments[1];
+                        var callback = arguments[arguments.length - 1];
+                        fetch(endpoint, {
+                            method: 'POST',
+                            headers: {
+                                'HX-Request': 'true',
+                                'Content-Type': 'application/x-www-form-urlencoded'
+                            },
+                            body: 'cf-turnstile-response=' + encodeURIComponent(token)
+                        }).then(response => {
+                            let redirectUrl = response.headers.get('hx-redirect') || response.headers.get('location');
+                            if (redirectUrl) {
+                                callback(redirectUrl);
+                            } else {
+                                response.text().then(t => callback(t));
+                            }
+                        }).catch(e => callback("ERROR"));
+                        """
+
+                        # Allow async script to wait for the fetch to resolve
+                        drv.set_script_timeout(10)
+                        try:
+                            result = drv.execute_async_script(js_fetch, turnstile_token, post_endpoint)
+
+                            if result:
+                                if result.startswith("http"):
+                                    return result
+                                else:
+                                    # If the server returned HTML text with the link instead of a redirect header
+                                    match_url = re.search(r'(https://dl\.fuckingfast\.co/dl/[^\'"]+)', result)
+                                    if match_url:
+                                        return match_url.group(1)
+                                    diag(f"POST gave no link for {filename}; response starts: {result[:300]!r}")
+                        except Exception:
+                            diag("ASYNC SCRIPT ERROR", exc=True)
+                            pass # Keep trying if network blips
+
+                # Timed out — record exactly what state the page was stuck in
+                try:
+                    title = drv.title
+                except Exception:
+                    title = "<unavailable>"
+                is_cf_challenge = ("Just a moment" in last_html) or ("challenges.cloudflare.com" in last_html)
+                diag(f"RESOLVE TIMEOUT {filename}: title={title!r} cf_challenge={is_cf_challenge} "
+                     f"hx_post_seen={saw_hx_post} turnstile_token={'set' if last_token else repr(last_token)} "
+                     f"html_len={len(last_html)}")
+                # Counts both an unsolved captcha on the file page and the full
+                # "Just a moment..." interstitial Cloudflare escalates to
+                if is_cf_challenge and not last_token:
+                    captcha_blocked += 1
+                return None
+
             for i, link in enumerate(links, 1):
                 filename = link.split('#')[-1] if '#' in link else link.split('/')[-1]
                 self.root.after(0, self.update_ui, f"Processing [{i}/{total}]: {filename}")
-                
-                try:
-                    driver.get(link)
-                    
-                    direct_url = None
-                    for _ in range(30):  
-                        time.sleep(1)
-                        page_html = driver.page_source
-                        
-                        # Fallback: Old window.open method
-                        match_old = re.search(r'window\.open\("([^"]+)"\)', page_html)
-                        if match_old:
-                            direct_url = match_old.group(1)
-                            break
-                            
-                        # NEW METHOD: HTMX Post Button
-                        match_new = re.search(r'hx-post="([^"]+)"', page_html)
-                        if match_new:
-                            # 1. Wait for Cloudflare to generate the Turnstile Token
-                            turnstile_token = driver.execute_script("return window.turnstileToken;")
-                            if not turnstile_token:
-                                continue  # Token isn't ready yet, keep waiting
-                                
-                            post_endpoint = match_new.group(1)
-                            
-                            # 2. Run the POST request INSIDE the browser using native JS fetch!
-                            # This bypasses the ad-click requirement and uses Chrome's own network stack 
-                            # so Cloudflare's TLS fingerprinting cannot block it.
-                            js_fetch = f"""
-                            var callback = arguments[0];
-                            fetch('{post_endpoint}', {{
-                                method: 'POST',
-                                headers: {{
-                                    'HX-Request': 'true',
-                                    'Content-Type': 'application/x-www-form-urlencoded'
-                                }},
-                                body: 'cf-turnstile-response=' + encodeURIComponent(window.turnstileToken)
-                            }}).then(response => {{
-                                let redirectUrl = response.headers.get('hx-redirect') || response.headers.get('location');
-                                if (redirectUrl) {{
-                                    callback(redirectUrl);
-                                }} else {{
-                                    response.text().then(t => callback(t));
-                                }}
-                            }}).catch(e => callback("ERROR"));
-                            """
-                            
-                            # Allow async script to wait for the fetch to resolve
-                            driver.set_script_timeout(10)
-                            try:
-                                result = driver.execute_async_script(js_fetch)
-                                
-                                if result:
-                                    if result.startswith("http"):
-                                        direct_url = result
-                                        break
-                                    else:
-                                        # If the server returned HTML text with the link instead of a redirect header
-                                        match_url = re.search(r'(https://dl\.fuckingfast\.co/dl/[^\'"]+)', result)
-                                        if match_url:
-                                            direct_url = match_url.group(1)
-                                            break
-                            except:
-                                pass # Keep trying if network blips
-                            
-                    if direct_url:
-                        self.root.after(0, self.update_ui, None, i, None, direct_url)
-                    else:
-                        self.root.after(0, self.update_ui, None, i, None, f"# FAILED: {filename} ({link})")
-                        
-                except Exception as e:
-                    self.root.after(0, self.update_ui, None, i, None, f"# ERROR: {str(e)} -> {filename}")
 
-            self.root.after(0, self.update_ui, f"Extraction complete! Processed {total} links.")
+                for attempt in range(2):
+                    try:
+                        direct_url = extract_one(driver, link, filename)
+                        if direct_url:
+                            resolved_any = True
+                            self.root.after(0, self.update_ui, None, i, None, direct_url)
+                        else:
+                            self.root.after(0, self.update_ui, None, i, None, f"# FAILED: {filename} ({link})")
+                        break
+                    except Exception as e:
+                        if attempt == 0 and session_is_dead(e):
+                            diag(f"BROWSER GONE on [{i}/{total}] {filename}: {e} — relaunching {browser_name} and retrying")
+                            self.root.after(0, self.update_ui, f"Browser closed — relaunching {browser_name}, retrying [{i}/{total}]...")
+                            try:
+                                driver.quit()
+                            except Exception:
+                                pass
+                            driver = create_driver(version=working_version)
+                            continue
+                        diag(f"LINK ERROR [{i}/{total}] {filename}: {e}", exc=True)
+                        self.root.after(0, self.update_ui, None, i, None, f"# ERROR: {str(e)} -> {filename}")
+                        break
+
+                # Stop early instead of spending a minute per link on a browser
+                # Cloudflare will keep rejecting for the whole run
+                if detectable_browser and captcha_blocked >= 2 and not resolved_any:
+                    diag(f"ABORT: Cloudflare never issued a token in {browser_name} after {captcha_blocked} links")
+                    self.root.after(0, self.update_ui,
+                        f"Cloudflare is rejecting {browser_name}: the captcha never completes for an automated "
+                        f"{browser_name} window. Use Google Chrome or Brave instead.")
+                    self.root.after(0, self.update_ui, None, None, None,
+                        f"# STOPPED after {i} links: Cloudflare would not verify {browser_name}. "
+                        f"Re-run with Google Chrome or Brave.")
+                    break
+
+            else:
+                self.root.after(0, self.update_ui, f"Extraction complete! Processed {total} links.")
             
         except Exception as e:
+            diag(f"CRITICAL ERROR: {e}", exc=True)
             self.root.after(0, self.update_ui, f"Critical Error: {str(e)}")
             
         finally:
