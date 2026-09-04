@@ -1,5 +1,22 @@
 import setuptools  # Register distutils fallback
 import os
+import traceback
+import datetime
+
+# --- TEMP DIAGNOSTICS (remove after debugging) ---
+DIAG_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "diagnostics.log")
+
+def diag(msg, exc=False):
+    line = f"[{datetime.datetime.now():%H:%M:%S}] {msg}"
+    if exc:
+        line += "\n" + traceback.format_exc()
+    print(line, flush=True)
+    try:
+        with open(DIAG_LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+# --------------------------------------------------
 import tkinter as tk
 from tkinter import ttk, messagebox
 import threading
@@ -8,6 +25,8 @@ import re
 import requests
 from bs4 import BeautifulSoup
 import undetected_chromedriver as uc
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.action_chains import ActionChains
 
 class FitgirlExtractorApp:
     def __init__(self, root):
@@ -240,6 +259,7 @@ class FitgirlExtractorApp:
             self.root.after(0, self.update_ui, "Network Error: Cannot reach FitGirl. Is your ISP blocking it? Try a VPN/Custom DNS.")
             self.root.after(0, lambda: self.fetch_btn.config(state="normal"))
         except Exception as e:
+            diag(f"FETCH ERROR: {e}", exc=True)
             self.root.after(0, self.update_ui, f"Error fetching links: {str(e)}")
             self.root.after(0, lambda: self.fetch_btn.config(state="normal"))
 
@@ -347,6 +367,7 @@ class FitgirlExtractorApp:
             return
 
         browser_name = os.path.basename(browser_executable).replace('.exe', '')
+        diag(f"EXTRACTION START: {total} links, browser={selected_browser} -> {browser_executable}")
         self.root.after(0, self.update_ui, f"Initializing using {browser_name} to bypass Cloudflare...", 0, total)
         
         def create_driver(version=None):
@@ -355,8 +376,9 @@ class FitgirlExtractorApp:
                 from selenium.webdriver.firefox.options import Options
                 opts = Options()
                 opts.binary_location = browser_executable
+                # geckodriver exposes navigator.webdriver regardless of these
+                # preferences, so Cloudflare can still detect the session
                 opts.set_preference("dom.webdriver.enabled", False)
-                opts.set_preference("useAutomationExtension", False)
                 return webdriver.Firefox(options=opts)
             elif browser_name.lower() == 'msedge':
                 from selenium import webdriver
@@ -376,15 +398,49 @@ class FitgirlExtractorApp:
                     version_main=version
                 )
         
+        def ensure_window(drv):
+            # Reattach to a surviving window and keep a spare blank tab open,
+            # so a site closing its own window can't take the whole browser down
+            handles = drv.window_handles
+            if not handles:
+                raise RuntimeError("all browser windows closed")
+            try:
+                drv.current_window_handle
+            except Exception:
+                drv.switch_to.window(handles[-1])
+            if len(drv.window_handles) < 2:
+                try:
+                    drv.execute_script("window.open('about:blank','_blank');")
+                except Exception:
+                    pass
+
+        def session_is_dead(err):
+            msg = str(err)
+            return any(s in msg for s in (
+                "invalid session id",
+                "browser has closed",
+                "not connected to DevTools",
+                "no such window",
+                "web view not found",
+                "chrome not reachable",
+                "unable to connect to renderer",
+                "Tried to run command without establishing a connection",
+                "Browsing context has been discarded",
+                "Failed to decode response from marionette",
+            ))
+
+        working_version = None
         try:
             try:
                 driver = create_driver()
             except Exception as e:
+                diag(f"DRIVER CREATE ERROR ({browser_name}): {e}", exc=True)
                 error_msg = str(e)
                 if browser_name.lower() not in ['firefox', 'msedge'] and "Current browser version is" in error_msg:
                     match = re.search(r"Current browser version is (\d+)", error_msg)
                     if match:
                         correct_version = int(match.group(1))
+                        working_version = correct_version
                         self.root.after(0, self.update_ui, f"Auto-fixing ChromeDriver version to v{correct_version}...")
                         driver = create_driver(version=correct_version)
                     else:
@@ -476,9 +532,11 @@ class FitgirlExtractorApp:
                 except Exception as e:
                     self.root.after(0, self.update_ui, None, i, None, f"# ERROR: {str(e)} -> {filename}")
 
-            self.root.after(0, self.update_ui, f"Extraction complete! Processed {total} links.")
+            else:
+                self.root.after(0, self.update_ui, f"Extraction complete! Processed {total} links.")
             
         except Exception as e:
+            diag(f"CRITICAL ERROR: {e}", exc=True)
             self.root.after(0, self.update_ui, f"Critical Error: {str(e)}")
             
         finally:
