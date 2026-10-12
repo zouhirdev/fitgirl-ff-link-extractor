@@ -17,16 +17,101 @@ def diag(msg, exc=False):
     except OSError:
         pass
 # --------------------------------------------------
+import base64
+import json
+import zlib
 import tkinter as tk
 from tkinter import ttk, messagebox
 import threading
 import time
 import re
 import requests
+import base58
 from bs4 import BeautifulSoup
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.action_chains import ActionChains
+
+FF_LINK_RE = re.compile(
+    r"https?://(?:www\.)?fuckingfast\.co/[^\s\"'<>\]]+",
+    re.IGNORECASE,
+)
+PASTE_URL_RE = re.compile(
+    r"https?://paste\.fitgirl-repacks\.site/\?[0-9a-fA-F]+#[A-Za-z0-9]+",
+    re.IGNORECASE,
+)
+
+
+def extract_ff_links(text):
+    """Pull unique fuckingfast.co URLs from HTML, markdown, or plain text."""
+    links = []
+    seen = set()
+    for match in FF_LINK_RE.findall(text or ""):
+        url = match.rstrip(").,;]")
+        if url not in seen:
+            seen.add(url)
+            links.append(url)
+    return links
+
+
+def decrypt_privatebin_paste(paste_url):
+    """
+    Decrypt a PrivateBin v2 paste (FitGirl pastebin).
+    URL form: https://paste.fitgirl-repacks.site/?<id>#<base58-key>
+    """
+    paste_url = paste_url.strip()
+    if "?" not in paste_url or "#" not in paste_url:
+        raise ValueError("Paste URL must include ?pasteid#key")
+
+    base, rest = paste_url.split("?", 1)
+    pasteid, key_b58 = rest.split("#", 1)
+    pasteid = pasteid.split("&")[0].replace("pasteid=", "")
+    key_b58 = key_b58.split("&")[0].strip()
+    key = base58.b58decode(key_b58)
+    if len(key) != 32:
+        raise ValueError(f"Invalid paste key length: {len(key)} (expected 32)")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "application/json",
+        "X-Requested-With": "JSONHttpRequest",
+    }
+    api_url = f"{base.rstrip('/')}/?{pasteid}"
+    res = requests.get(api_url, headers=headers, timeout=20)
+    res.raise_for_status()
+    data = res.json()
+    if data.get("status", 0) != 0:
+        raise ValueError(f"Paste API error: {data.get('message', data)}")
+
+    adata = data["adata"]
+    iv_b64, salt_b64, iterations, key_bits, tag_bits, _cipher, _mode, compression = adata[0]
+    iv = base64.b64decode(iv_b64)
+    salt = base64.b64decode(salt_b64)
+    ciphertext = base64.b64decode(data["ct"])
+    aad = json.dumps(adata, separators=(",", ":")).encode("utf-8")
+
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=key_bits // 8,
+        salt=salt,
+        iterations=int(iterations),
+    )
+    aes_key = kdf.derive(key)
+    plain = AESGCM(aes_key).decrypt(iv, ciphertext, aad)
+
+    if compression == "zlib":
+        try:
+            plain = zlib.decompress(plain, -zlib.MAX_WBITS)
+        except zlib.error:
+            plain = zlib.decompress(plain)
+    elif compression not in (None, "none"):
+        raise ValueError(f"Unsupported paste compression: {compression}")
+
+    payload = json.loads(plain.decode("utf-8"))
+    return payload.get("paste", "")
 
 class FitgirlExtractorApp:
     def __init__(self, root):
@@ -68,7 +153,11 @@ class FitgirlExtractorApp:
         input_frame.grid(row=0, column=0, sticky="ew")
         input_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(input_frame, text="FitGirl Game URL:", font=("Arial", 10, "bold")).grid(row=0, column=0, sticky="w", pady=5)
+        ttk.Label(
+            input_frame,
+            text="Paste URL / Game URL / HTML or fuckingfast links:",
+            font=("Arial", 10, "bold"),
+        ).grid(row=0, column=0, sticky="w", pady=5)
         
         self.url_var = tk.StringVar()
         self.url_var.set("https://fitgirl-repacks.site/grand-theft-auto-v/")
@@ -223,40 +312,91 @@ class FitgirlExtractorApp:
     # --- Step 1: Fetching Links ---
 
     def start_fetch_thread(self):
-        url = self.url_var.get().strip()
-        if not url:
-            messagebox.showerror("Error", "Please enter a valid FitGirl URL.")
+        raw = self.url_var.get().strip()
+        if not raw:
+            messagebox.showerror(
+                "Error",
+                "Enter a FitGirl paste URL, game page URL, or paste fuckingfast HTML/links.",
+            )
             return
 
         self.fetch_btn.config(state="disabled")
         self.extract_btn.config(state="disabled")
-        self.status_var.set("Fetching page...")
+        self.status_var.set("Fetching / decrypting links...")
         
         # Clear existing checkboxes
         for widget in self.scrollable_frame.winfo_children():
             widget.destroy()
         self.checkbox_vars.clear()
 
-        thread = threading.Thread(target=self.run_fetch, args=(url,), daemon=True)
+        thread = threading.Thread(target=self.run_fetch, args=(raw,), daemon=True)
         thread.start()
 
-    def run_fetch(self, url):
+    def _links_from_paste_url(self, paste_url):
+        paste_text = decrypt_privatebin_paste(paste_url)
+        return extract_ff_links(paste_text)
+
+    def _links_from_page_html(self, html):
+        links = extract_ff_links(html)
+        soup = BeautifulSoup(html, "html.parser")
+        paste_urls = []
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            if "paste.fitgirl-repacks.site" in href and "#" in href:
+                paste_urls.append(href)
+            elif "fuckingfast.co" in href and href not in links:
+                links.append(href)
+        for match in PASTE_URL_RE.findall(html):
+            if match not in paste_urls:
+                paste_urls.append(match)
+        for paste_url in paste_urls:
+            for link in self._links_from_paste_url(paste_url):
+                if link not in links:
+                    links.append(link)
+        return links
+
+    def run_fetch(self, raw):
         try:
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-            res = requests.get(url, headers=headers, timeout=10) # Restored Timeout
-            res.raise_for_status() 
-            soup = BeautifulSoup(res.text, 'html.parser')
-            
             ff_links = []
-            for a in soup.find_all('a', href=True):
-                if 'fuckingfast.co' in a['href'] and a['href'] not in ff_links:
-                    ff_links.append(a['href'])
-            
+            non_empty = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+            first_line = non_empty[0] if non_empty else ""
+            is_single_http_url = (
+                len(non_empty) == 1
+                and first_line.lower().startswith("http")
+                and "<" not in first_line
+            )
+
+            # A) PrivateBin paste URL(s) — decrypt client-side AES paste
+            paste_urls = PASTE_URL_RE.findall(raw)
+            if not paste_urls and is_single_http_url and "paste.fitgirl-repacks.site" in first_line:
+                paste_urls = [first_line]
+            if paste_urls:
+                self.root.after(0, self.update_ui, "Decrypting PrivateBin paste...")
+                for paste_url in paste_urls:
+                    for link in self._links_from_paste_url(paste_url):
+                        if link not in ff_links:
+                            ff_links.append(link)
+
+            # B) FitGirl game page — scrape FF links and any nested paste links
+            if not ff_links and is_single_http_url and "fuckingfast.co" not in first_line.lower():
+                self.root.after(0, self.update_ui, "Fetching game page...")
+                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+                res = requests.get(first_line, headers=headers, timeout=20)
+                res.raise_for_status()
+                ff_links = self._links_from_page_html(res.text)
+
+            # C) Pasted HTML (<a href="https://fuckingfast.co/...">), markdown, or raw FF URLs
+            if not ff_links:
+                ff_links = extract_ff_links(raw)
+
             self.root.after(0, self.populate_checkboxes, ff_links)
-            
+
         except requests.exceptions.ConnectionError:
-            # Restored Network Block warning!
-            self.root.after(0, self.update_ui, "Network Error: Cannot reach FitGirl. Is your ISP blocking it? Try a VPN/Custom DNS.")
+            self.root.after(
+                0,
+                self.update_ui,
+                "Network Error: Cannot reach host. Is your ISP blocking it? Try a VPN/Custom DNS.",
+            )
             self.root.after(0, lambda: self.fetch_btn.config(state="normal"))
         except Exception as e:
             diag(f"FETCH ERROR: {e}", exc=True)
