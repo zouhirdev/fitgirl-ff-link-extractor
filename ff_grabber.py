@@ -1,4 +1,3 @@
-import setuptools  # Register distutils fallback
 import os
 import traceback
 import datetime
@@ -24,9 +23,11 @@ import time
 import re
 import requests
 from bs4 import BeautifulSoup
-import undetected_chromedriver as uc
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.action_chains import ActionChains
+from ff_http import create_http_session, extract_direct_url, is_direct_url
+
+
+AUTO_MODE = "Auto-Detect Browser"
+HTTP_MODE = "No Browser (HTTP)"
 
 class FitgirlExtractorApp:
     def __init__(self, root):
@@ -114,16 +115,20 @@ class FitgirlExtractorApp:
         
         self.extract_btn = ttk.Button(controls_frame, text="2. Extract Selected", command=self.start_extraction_thread, state="disabled")
         self.extract_btn.pack(side="right", padx=2)
-        self.browser_var = tk.StringVar(value="Auto-Detect Browser")
-        self.browser_combo = ttk.Combobox(controls_frame, textvariable=self.browser_var, state="readonly", width=18)
+        mode_frame = ttk.Frame(checklist_container)
+        mode_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(5, 0))
+        ttk.Label(mode_frame, text="Extraction method:").pack(side="left")
+        self.browser_var = tk.StringVar(value=HTTP_MODE)
+        self.browser_combo = ttk.Combobox(mode_frame, textvariable=self.browser_var, state="readonly", width=24)
         self.browser_combo['values'] = (
-                    "Auto-Detect Browser", 
+                    HTTP_MODE,
+                    AUTO_MODE,
                     "Google Chrome", 
                     "Microsoft Edge", 
                     "Brave", 
                     "Mozilla Firefox"
                 )
-        self.browser_combo.pack(side="right", padx=(5, 10))
+        self.browser_combo.pack(side="left", padx=5)
 
         # 4. Progress Bar
         self.progress = ttk.Progressbar(
@@ -285,12 +290,7 @@ class FitgirlExtractorApp:
 
 
     # --- Step 2: Extraction ---
-    def get_browser_path(self, selected_browser="Auto-Detect Browser"):
-        import sys
-        
-        # Check if running on Linux / Steam Deck
-        is_linux = sys.platform.startswith('linux')
-        
+    def get_browser_path(self, selected_browser=AUTO_MODE):
         browser_paths = {
             "Google Chrome": [
                 r"%ProgramFiles%\Google\Chrome\Application\chrome.exe",
@@ -324,7 +324,7 @@ class FitgirlExtractorApp:
             ]
         }
         
-        if selected_browser != "Auto-Detect Browser":
+        if selected_browser != AUTO_MODE:
             paths_to_check = browser_paths.get(selected_browser, [])
         else:
             paths_to_check = []
@@ -348,27 +348,73 @@ class FitgirlExtractorApp:
 
         self.fetch_btn.config(state="disabled")
         self.extract_btn.config(state="disabled")
+        self.browser_combo.config(state="disabled")
         self.clear_output()
 
-        thread = threading.Thread(target=self.run_extraction, args=(selected_links,), daemon=True)
+        selected_browser = self.browser_var.get()
+        thread = threading.Thread(target=self.run_extraction, args=(selected_links, selected_browser), daemon=True)
         thread.start()
 
-    def run_extraction(self, links):
-        driver = None
+    def run_extraction(self, links, selected_browser=HTTP_MODE):
         total = len(links)
-        
-        selected_browser = self.browser_var.get()
-        browser_executable = self.get_browser_path(selected_browser)
-        
-        if not browser_executable:
-            self.root.after(0, self.update_ui, f"Error: Could not find {selected_browser} on your system.")
+        completed = set()
+        successes = 0
+        self.root.after(0, self.update_ui, "Starting extraction...", 0, total)
+
+        def record_result(link, direct_url=None, error=None):
+            nonlocal successes
+            if link in completed:
+                return
+            completed.add(link)
+            if direct_url:
+                successes += 1
+                output = direct_url
+            else:
+                filename = link.split('#')[-1] if '#' in link else link.split('/')[-1]
+                output = f"# FAILED: {filename} ({link}) - {error}"
+            self.root.after(0, self.update_ui, None, len(completed), None, output)
+
+        try:
+            if selected_browser == HTTP_MODE:
+                with create_http_session() as session:
+                    for i, link in enumerate(links, 1):
+                        self.root.after(0, self.update_ui, f"HTTP extraction [{i}/{total}]...")
+                        try:
+                            record_result(link, extract_direct_url(link, session))
+                        except Exception as exc:
+                            diag(f"HTTP extraction failed for {link.split('#')[0]}: {exc}")
+                            record_result(link, error=str(exc))
+            else:
+                browser_executable = self.get_browser_path(selected_browser)
+                if not browser_executable:
+                    raise RuntimeError(f"Could not find {selected_browser}. Install a supported browser or choose {HTTP_MODE}.")
+                self.extract_with_browser(links, browser_executable, record_result)
+
+            self.root.after(0, self.update_ui, f"Extraction complete! Resolved {successes}/{total} links; {total - successes} failed.")
+        except Exception as exc:
+            diag(f"EXTRACTION ERROR: {exc}", exc=True)
+            for link in links:
+                record_result(link, error=str(exc))
+            self.root.after(0, self.update_ui, f"Extraction stopped: {exc} (resolved {successes}/{total}).")
+        finally:
             self.root.after(0, lambda: self.fetch_btn.config(state="normal"))
             self.root.after(0, lambda: self.extract_btn.config(state="normal"))
-            return
+            self.root.after(0, lambda: self.browser_combo.config(state="readonly"))
+            if selected_browser == HTTP_MODE and successes < total:
+                self.root.after(
+                    0, messagebox.showwarning, "HTTP extraction incomplete",
+                    f"HTTP extraction failed for {total - successes} of {total} links.\n\n"
+                    "Select Auto-Detect Browser or an installed browser from "
+                    "Extraction method and retry the failed links.",
+                )
+
+    def extract_with_browser(self, links, browser_executable, record_result):
+        driver = None
+        total = len(links)
 
         browser_name = os.path.basename(browser_executable).replace('.exe', '')
-        diag(f"EXTRACTION START: {total} links, browser={selected_browser} -> {browser_executable}")
-        self.root.after(0, self.update_ui, f"Initializing using {browser_name} to bypass Cloudflare...", 0, total)
+        diag(f"BROWSER EXTRACTION START: {total} links, browser={browser_executable}")
+        self.root.after(0, self.update_ui, f"Initializing {browser_name}; complete any challenge in the browser window...")
         
         def create_driver(version=None):
             if browser_name.lower() == 'firefox':
@@ -390,6 +436,9 @@ class FitgirlExtractorApp:
                 opts.add_argument("--disable-blink-features=AutomationControlled")
                 return webdriver.Edge(options=opts)
             else:
+                import setuptools  # Register distutils fallback before importing UC
+                import undetected_chromedriver as uc
+
                 opts = uc.ChromeOptions()
                 return uc.Chrome(
                     options=opts, 
@@ -506,42 +555,36 @@ class FitgirlExtractorApp:
                     direct_url = None
                     for _ in range(30):
                         time.sleep(1)
+
+                        # A completed challenge may have replaced the original page.
+                        driver.execute_script(js_inject)
                         
                         # Click the button and check if our interceptor caught the URL
                         result = driver.execute_script(js_click)
-                        if result and "dl.fuckingfast.co" in result:
+                        if result and is_direct_url(result):
                             direct_url = result
                             break
                             
                         # Fallback: check if the browser natively navigated to the link
-                        if "dl.fuckingfast.co" in driver.current_url:
+                        if is_direct_url(driver.current_url):
                             direct_url = driver.current_url
                             break
                             
                         # Fallback: Old window.open method
-                        match_old = re.search(r'window\.open\("([^"]+)"\)', driver.page_source)
-                        if match_old:
+                        match_old = re.search(r'''window\.open\(\s*["']([^"']+)["']''', driver.page_source)
+                        if match_old and is_direct_url(match_old.group(1)):
                             direct_url = match_old.group(1)
                             break
                             
                     if direct_url:
-                        self.root.after(0, self.update_ui, None, i, None, direct_url)
+                        record_result(link, direct_url)
                     else:
-                        self.root.after(0, self.update_ui, None, i, None, f"# FAILED: {filename} ({link})")
+                        record_result(link, error="No direct URL found within 30 seconds.")
                         
                 except Exception as e:
-                    self.root.after(0, self.update_ui, None, i, None, f"# ERROR: {str(e)} -> {filename}")
-
-            else:
-                self.root.after(0, self.update_ui, f"Extraction complete! Processed {total} links.")
-            
-        except Exception as e:
-            diag(f"CRITICAL ERROR: {e}", exc=True)
-            self.root.after(0, self.update_ui, f"Critical Error: {str(e)}")
+                    record_result(link, error=str(e))
             
         finally:
-            self.root.after(0, lambda: self.fetch_btn.config(state="normal"))
-            self.root.after(0, lambda: self.extract_btn.config(state="normal"))
             if driver:
                 try:
                     driver.quit()
