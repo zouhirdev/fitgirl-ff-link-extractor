@@ -1,8 +1,10 @@
 # FitGirl FuckingFast Link Extractor
 
-A lightweight, threaded desktop GUI tool built in Python to retrieve, filter, and extract direct download links from FuckingFast hosters on FitGirl Repack pages.
+A lightweight, threaded desktop GUI tool built in Python to retrieve, filter, and extract direct download links from FuckingFast hosters on FitGirl Repack pages and [paste.fitgirl-repacks.site](https://paste.fitgirl-repacks.site) PrivateBin pastes.
 
 ## Features
+- **Paste support:** Decrypts FitGirl PrivateBin URLs (`?id#key`) and pulls every `fuckingfast.co` link.
+- **HTML / raw links:** Accepts pasted `<a href="https://fuckingfast.co/...">` snippets or plain FF URLs.
 - **Fast Parsing:** Instantly pulls files, setup binaries, and optional parts.
 - **Selective Scrape:** Use checkboxes to exclude unwanted files (like bonus content, other languages, etc.) before running the slow browser extraction process.
 - **Cloudflare Bypass:** Employs an undetected browser process to seamlessly pass Turnstile checks.
