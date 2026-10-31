@@ -1,22 +1,5 @@
 import setuptools  # Register distutils fallback
 import os
-import traceback
-import datetime
-
-# --- TEMP DIAGNOSTICS (remove after debugging) ---
-DIAG_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "diagnostics.log")
-
-def diag(msg, exc=False):
-    line = f"[{datetime.datetime.now():%H:%M:%S}] {msg}"
-    if exc:
-        line += "\n" + traceback.format_exc()
-    print(line, flush=True)
-    try:
-        with open(DIAG_LOG, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except OSError:
-        pass
-# --------------------------------------------------
 import base64
 import json
 import zlib
@@ -113,6 +96,7 @@ def decrypt_privatebin_paste(paste_url):
     payload = json.loads(plain.decode("utf-8"))
     return payload.get("paste", "")
 
+
 class FitgirlExtractorApp:
     def __init__(self, root):
         self.root = root
@@ -126,19 +110,24 @@ class FitgirlExtractorApp:
         self.root.rowconfigure(5, weight=1) # Output area
 
         self.checkbox_vars = {}  # Store {url: BooleanVar}
+        self.checkbox_list = []
+        self.widget_to_index = {}
+        self.last_clicked_idx = None
+        self.drag_target_val = None
+        self.drag_scroll_job = None
+        self.last_drag_y = None
         
-        # --- Add this style configuration ---
+        # Custom Progress Bar Theme
         self.style = ttk.Style()
-        self.style.theme_use("clam")  # Ensures color customization works
+        self.style.theme_use("clam")
         self.style.configure(
             "Custom.Horizontal.TProgressbar",
-            background="#24890d",   # Green color matching FitGirl's style
-            troughcolor="#e0e0e0",  # Light grey empty background track
-            bordercolor="#24890d",  # Matching border
+            background="#24890d",
+            troughcolor="#e0e0e0",
+            bordercolor="#24890d",
             lightcolor="#24890d",
             darkcolor="#24890d"
         )
-        # ------------------------------------
 
         self.setup_ui()
 
@@ -146,6 +135,7 @@ class FitgirlExtractorApp:
         self.root.bind_all("<MouseWheel>", self._on_mousewheel)
         self.root.bind_all("<Button-4>", self._on_mousewheel) 
         self.root.bind_all("<Button-5>", self._on_mousewheel)
+        self.root.bind_all("<ButtonRelease-1>", self._on_mouse_release)
 
     def setup_ui(self):
         # 1. Input Frame
@@ -174,7 +164,11 @@ class FitgirlExtractorApp:
         status_label.grid(row=1, column=0, sticky="w", padx=10)
 
         # 3. Checklist Area (Scrollable)
-        checklist_container = ttk.LabelFrame(self.root, text="Found Parts (Uncheck unwanted)", padding="5 5 5 5")
+        checklist_container = ttk.LabelFrame(
+            self.root,
+            text="Found Parts (Click, Shift+Click, or Drag to toggle)",
+            padding="5 5 5 5"
+        )
         checklist_container.grid(row=2, column=0, sticky="nsew", padx=10, pady=5)
         checklist_container.rowconfigure(0, weight=1)
         checklist_container.columnconfigure(0, weight=1)
@@ -206,12 +200,12 @@ class FitgirlExtractorApp:
         self.browser_var = tk.StringVar(value="Auto-Detect Browser")
         self.browser_combo = ttk.Combobox(controls_frame, textvariable=self.browser_var, state="readonly", width=18)
         self.browser_combo['values'] = (
-                    "Auto-Detect Browser", 
-                    "Google Chrome", 
-                    "Microsoft Edge", 
-                    "Brave", 
-                    "Mozilla Firefox"
-                )
+            "Auto-Detect Browser", 
+            "Google Chrome", 
+            "Microsoft Edge", 
+            "Brave", 
+            "Mozilla Firefox"
+        )
         self.browser_combo.pack(side="right", padx=(5, 10))
 
         # 4. Progress Bar
@@ -219,7 +213,7 @@ class FitgirlExtractorApp:
             self.root, 
             orient="horizontal", 
             mode="determinate",
-            style="Custom.Horizontal.TProgressbar"  # Apply our custom style here
+            style="Custom.Horizontal.TProgressbar"
         )
         self.progress.grid(row=4, column=0, sticky="ew", padx=10, pady=5)
 
@@ -250,22 +244,16 @@ class FitgirlExtractorApp:
         self.clear_btn = ttk.Button(btn_frame, text="Clear Output", command=self.clear_output)
         self.clear_btn.pack(side="right", padx=10)
 
-
-    # --- Mousewheel Logic ---
+    # --- Mousewheel & Multi-Select Logic ---
 
     def _on_mousewheel(self, event):
         try:
-            # Find exactly what widget the mouse is currently hovering over
             widget = self.root.winfo_containing(event.x_root, event.y_root)
-            
-            # If hovering over the canvas or any checkbox inside the scrollable frame
             if widget == self.canvas or (widget and str(widget).startswith(str(self.scrollable_frame))):
                 if hasattr(event, 'delta') and event.delta != 0:
-                    # Windows / macOS
                     direction = -1 if event.delta > 0 else 1
                     self.canvas.yview_scroll(direction, "units")
                 elif hasattr(event, 'num'):
-                    # Linux
                     if event.num == 4:
                         self.canvas.yview_scroll(-1, "units")
                     elif event.num == 5:
@@ -273,6 +261,105 @@ class FitgirlExtractorApp:
         except Exception:
             pass
 
+    def _on_chk_press(self, event, idx):
+        """Normal click: toggle this item and set the drag/shift anchor."""
+        var, _ = self.checkbox_list[idx]
+        new_val = not var.get()
+        var.set(new_val)
+        self.last_clicked_idx = idx
+        self.drag_target_val = new_val
+        return "break"
+
+    def _on_chk_shift_press(self, event, idx):
+        """Shift+Click: set all checkboxes between the last clicked item and this one."""
+        if self.last_clicked_idx is None:
+            return self._on_chk_press(event, idx)
+
+        anchor_var, _ = self.checkbox_list[self.last_clicked_idx]
+        target_val = anchor_var.get()
+
+        start = min(self.last_clicked_idx, idx)
+        end = max(self.last_clicked_idx, idx)
+        for i in range(start, end + 1):
+            self.checkbox_list[i][0].set(target_val)
+
+        self.last_clicked_idx = idx
+        return "break"
+
+    def _on_chk_drag(self, event):
+        """Click-and-Drag: paint checkboxes and start auto-scroll near canvas edges."""
+        if self.drag_target_val is None:
+            return
+        self.last_drag_y = event.y_root
+        self._paint_drag_to_y(event.y_root)
+
+        if self.drag_scroll_job is None:
+            self._auto_scroll_step()
+
+    def _index_at_screen_y(self, y_root):
+        """Find the checkbox nearest a screen Y coordinate, clamped to the canvas."""
+        if not self.checkbox_list:
+            return None
+
+        canvas_top = self.canvas.winfo_rooty()
+        canvas_bottom = canvas_top + self.canvas.winfo_height()
+        clamped_y = max(canvas_top + 2, min(y_root, canvas_bottom - 2))
+        local_y = clamped_y - self.scrollable_frame.winfo_rooty()
+
+        return min(
+            range(len(self.checkbox_list)),
+            key=lambda i: abs(
+                self.checkbox_list[i][1].winfo_y()
+                + self.checkbox_list[i][1].winfo_height() / 2
+                - local_y
+            ),
+        )
+
+    def _paint_drag_to_y(self, y_root):
+        """Paint checkboxes between the previous and current vertical positions."""
+        idx = self._index_at_screen_y(y_root)
+        if idx is None:
+            return
+
+        if self.last_clicked_idx is not None:
+            start = min(self.last_clicked_idx, idx)
+            end = max(self.last_clicked_idx, idx)
+            for i in range(start, end + 1):
+                self.checkbox_list[i][0].set(self.drag_target_val)
+        else:
+            self.checkbox_list[idx][0].set(self.drag_target_val)
+        self.last_clicked_idx = idx
+
+    def _auto_scroll_step(self):
+        """Scroll and paint repeatedly while dragging near or beyond canvas edges."""
+        self.drag_scroll_job = None
+        if self.drag_target_val is None or self.last_drag_y is None:
+            return
+
+        canvas_top = self.canvas.winfo_rooty()
+        canvas_bottom = canvas_top + self.canvas.winfo_height()
+        edge_zone = 25
+
+        step = 0
+        if self.last_drag_y < canvas_top + edge_zone:
+            dist = (canvas_top + edge_zone) - self.last_drag_y
+            step = -max(1, min(4, int(dist // 15) + 1))
+        elif self.last_drag_y > canvas_bottom - edge_zone:
+            dist = self.last_drag_y - (canvas_bottom - edge_zone)
+            step = max(1, min(4, int(dist // 15) + 1))
+
+        if step != 0:
+            self.canvas.yview_scroll(step, "units")
+            self.root.update_idletasks()
+            self._paint_drag_to_y(self.last_drag_y)
+            self.drag_scroll_job = self.root.after(35, self._auto_scroll_step)
+
+    def _on_mouse_release(self, event):
+        self.drag_target_val = None
+        self.last_drag_y = None
+        if self.drag_scroll_job is not None:
+            self.root.after_cancel(self.drag_scroll_job)
+            self.drag_scroll_job = None
 
     # --- UI Logic ---
 
@@ -308,7 +395,6 @@ class FitgirlExtractorApp:
             self.text_area.insert(tk.END, text_append + "\n")
             self.text_area.see(tk.END)
 
-
     # --- Step 1: Fetching Links ---
 
     def start_fetch_thread(self):
@@ -324,10 +410,12 @@ class FitgirlExtractorApp:
         self.extract_btn.config(state="disabled")
         self.status_var.set("Fetching / decrypting links...")
         
-        # Clear existing checkboxes
         for widget in self.scrollable_frame.winfo_children():
             widget.destroy()
         self.checkbox_vars.clear()
+        self.checkbox_list.clear()
+        self.widget_to_index.clear()
+        self.last_clicked_idx = None
 
         thread = threading.Thread(target=self.run_fetch, args=(raw,), daemon=True)
         thread.start()
@@ -399,7 +487,7 @@ class FitgirlExtractorApp:
             )
             self.root.after(0, lambda: self.fetch_btn.config(state="normal"))
         except Exception as e:
-            diag(f"FETCH ERROR: {e}", exc=True)
+            print(f"FETCH ERROR: {e}")
             self.root.after(0, self.update_ui, f"Error fetching links: {str(e)}")
             self.root.after(0, lambda: self.fetch_btn.config(state="normal"))
 
@@ -409,28 +497,33 @@ class FitgirlExtractorApp:
             self.fetch_btn.config(state="normal")
             return
 
-        for link in links:
+        self.checkbox_list.clear()
+        self.widget_to_index.clear()
+        self.last_clicked_idx = None
+        self.drag_target_val = None
+
+        for idx, link in enumerate(links):
             var = tk.BooleanVar(value=True)
             self.checkbox_vars[link] = var
             
-            # Extract readable name
             filename = link.split('#')[-1] if '#' in link else link.split('/')[-1]
             
             chk = ttk.Checkbutton(self.scrollable_frame, text=filename, variable=var)
             chk.pack(anchor="w", padx=5, pady=2)
 
-        self.status_var.set(f"Found {len(links)} parts. Select what you need and click Extract.")
+            self.checkbox_list.append((var, chk))
+            self.widget_to_index[chk] = idx
+
+            chk.bind("<ButtonPress-1>", lambda e, i=idx: self._on_chk_press(e, i))
+            chk.bind("<Shift-ButtonPress-1>", lambda e, i=idx: self._on_chk_shift_press(e, i))
+            chk.bind("<B1-Motion>", self._on_chk_drag)
+
+        self.status_var.set(f"Found {len(links)} parts. (Tip: Shift+Click or Drag to multi-select)")
         self.fetch_btn.config(state="normal")
         self.extract_btn.config(state="normal")
 
-
     # --- Step 2: Extraction ---
     def get_browser_path(self, selected_browser="Auto-Detect Browser"):
-        import sys
-        
-        # Check if running on Linux / Steam Deck
-        is_linux = sys.platform.startswith('linux')
-        
         browser_paths = {
             "Google Chrome": [
                 r"%ProgramFiles%\Google\Chrome\Application\chrome.exe",
@@ -438,7 +531,7 @@ class FitgirlExtractorApp:
                 r"%LocalAppData%\Google\Chrome\Application\chrome.exe",
                 "/usr/bin/google-chrome",
                 "/usr/bin/google-chrome-stable",
-                "/var/lib/flatpak/exports/bin/com.google.Chrome" # Common Steam Deck Flatpak path
+                "/var/lib/flatpak/exports/bin/com.google.Chrome"
             ],
             "Microsoft Edge": [
                 r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe",
@@ -453,7 +546,7 @@ class FitgirlExtractorApp:
                 r"%LocalAppData%\BraveSoftware\Brave-Browser\Application\brave.exe",
                 "/usr/bin/brave-browser",
                 "/usr/bin/brave",
-                "/var/lib/flatpak/exports/bin/com.brave.Browser" # Common Steam Deck Flatpak path
+                "/var/lib/flatpak/exports/bin/com.brave.Browser"
             ],
             "Mozilla Firefox": [
                 r"%ProgramFiles%\Mozilla Firefox\firefox.exe",
@@ -472,12 +565,10 @@ class FitgirlExtractorApp:
                 paths_to_check.extend(paths)
 
         for path in paths_to_check:
-            # os.path.expandvars handles the Windows % variables, safely ignores Linux ones
             expanded_path = os.path.expandvars(path)
             if os.path.exists(expanded_path):
                 return expanded_path
         return None
-    
 
     def start_extraction_thread(self):
         selected_links = [url for url, var in self.checkbox_vars.items() if var.get()]
@@ -499,7 +590,6 @@ class FitgirlExtractorApp:
         
         selected_browser = self.browser_var.get()
         browser_executable = self.get_browser_path(selected_browser)
-        
         if not browser_executable:
             self.root.after(0, self.update_ui, f"Error: Could not find {selected_browser} on your system.")
             self.root.after(0, lambda: self.fetch_btn.config(state="normal"))
@@ -507,7 +597,7 @@ class FitgirlExtractorApp:
             return
 
         browser_name = os.path.basename(browser_executable).replace('.exe', '')
-        diag(f"EXTRACTION START: {total} links, browser={selected_browser} -> {browser_executable}")
+        print(f"EXTRACTION START: {total} links, browser={selected_browser} -> {browser_executable}")
         self.root.after(0, self.update_ui, f"Initializing using {browser_name} to bypass Cloudflare...", 0, total)
         
         def create_driver(version=None):
@@ -516,10 +606,9 @@ class FitgirlExtractorApp:
                 from selenium.webdriver.firefox.options import Options
                 opts = Options()
                 opts.binary_location = browser_executable
-                # geckodriver exposes navigator.webdriver regardless of these
-                # preferences, so Cloudflare can still detect the session
                 opts.set_preference("dom.webdriver.enabled", False)
                 return webdriver.Firefox(options=opts)
+                
             elif browser_name.lower() == 'msedge':
                 from selenium import webdriver
                 from selenium.webdriver.edge.options import Options
@@ -529,6 +618,7 @@ class FitgirlExtractorApp:
                 opts.add_experimental_option('useAutomationExtension', False)
                 opts.add_argument("--disable-blink-features=AutomationControlled")
                 return webdriver.Edge(options=opts)
+                
             else:
                 opts = uc.ChromeOptions()
                 return uc.Chrome(
@@ -539,8 +629,6 @@ class FitgirlExtractorApp:
                 )
         
         def ensure_window(drv):
-            # Reattach to a surviving window and keep a spare blank tab open,
-            # so a site closing its own window can't take the whole browser down
             handles = drv.window_handles
             if not handles:
                 raise RuntimeError("all browser windows closed")
@@ -574,7 +662,7 @@ class FitgirlExtractorApp:
             try:
                 driver = create_driver()
             except Exception as e:
-                diag(f"DRIVER CREATE ERROR ({browser_name}): {e}", exc=True)
+                print(f"DRIVER CREATE ERROR ({browser_name}): {e}")
                 error_msg = str(e)
                 if browser_name.lower() not in ['firefox', 'msedge'] and "Current browser version is" in error_msg:
                     match = re.search(r"Current browser version is (\d+)", error_msg)
@@ -588,95 +676,133 @@ class FitgirlExtractorApp:
                 else:
                     raise e
 
-            # --- Block downloads globally so Chrome doesn't actually download the 5GB files ---
-            if browser_name.lower() != 'firefox':
-                try:
-                    # (Removed the local 'import os' that was causing the crash!)
-                    driver.execute_cdp_cmd(
-                        "Browser.setDownloadBehavior", {
-                            "behavior": "deny",
-                            "downloadPath": os.path.abspath(os.sep)
-                        }
-                    )
-                except:
-                    pass
-            # ---------------------------------------------------------------------------------
+            detectable_browser = browser_name.lower() in ('firefox', 'msedge')
+            captcha_blocked = 0
+            resolved_any = False
+            if detectable_browser:
+                self.root.after(0, self.update_ui,
+                    f"Warning: Cloudflare can detect automation in {browser_name} and may refuse the captcha. "
+                    f"Google Chrome or Brave is recommended.")
 
-            # --- Javascript Interceptors ---
-            js_inject = """
-            // 1. Kill popup ads instantly
-            window.open = function() { return null; };
-            
-            // 2. Intercept the network request to catch the direct URL before HTMX processes it
-            if (!window.xhrIntercepted) {
-                window.xhrIntercepted = true;
-                var originalXHR = window.XMLHttpRequest;
-                window.XMLHttpRequest = function() {
-                    var xhr = new originalXHR();
-                    xhr.addEventListener('readystatechange', function() {
-                        if (xhr.readyState === 4) {
-                            var redirect = xhr.getResponseHeader('hx-redirect') || xhr.getResponseHeader('location');
-                            if (redirect && redirect.includes('dl.fuckingfast.co')) {
-                                document.body.setAttribute('data-direct-url', redirect);
+            def extract_one(drv, link, filename):
+                nonlocal captcha_blocked
+                ensure_window(drv)
+                drv.get(link)
+
+                last_html = ""
+                last_token = None
+                clicked_widget = False
+                for tick in range(60):
+                    time.sleep(1)
+                    page_html = drv.page_source
+                    last_html = page_html
+
+                    match_old = re.search(r'window\.open\("([^"]+)"\)', page_html)
+                    if match_old:
+                        return match_old.group(1)
+
+                    match_new = re.search(r'hx-post="([^"]+)"', page_html)
+                    if match_new:
+                        turnstile_token = drv.execute_script(
+                            "return window.turnstileToken"
+                            " || (document.querySelector('[name=\"cf-turnstile-response\"]') || {}).value"
+                            " || null;")
+                        last_token = turnstile_token
+                        if not turnstile_token:
+                            if 'data-sitekey' in page_html:
+                                if not clicked_widget and tick >= 2:
+                                    clicked_widget = True
+                                    try:
+                                        el = drv.find_element(By.ID, "cf-turnstile")
+                                        drv.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                                        ActionChains(drv).move_to_element_with_offset(
+                                            el, 30 - el.size['width'] // 2, 0).click().perform()
+                                    except Exception:
+                                        pass
+                                if tick == 10:
+                                    self.root.after(0, self.update_ui,
+                                        "Cloudflare check pending — if a captcha checkbox is visible in the browser window, please click it")
+                                continue
+                            turnstile_token = ""
+
+                        post_endpoint = match_new.group(1)
+                        js_fetch = """
+                        var token = arguments[0];
+                        var endpoint = arguments[1];
+                        var callback = arguments[arguments.length - 1];
+                        fetch(endpoint, {
+                            method: 'POST',
+                            headers: {
+                                'HX-Request': 'true',
+                                'Content-Type': 'application/x-www-form-urlencoded'
+                            },
+                            body: 'cf-turnstile-response=' + encodeURIComponent(token)
+                        }).then(response => {
+                            let redirectUrl = response.headers.get('hx-redirect') || response.headers.get('location');
+                            if (redirectUrl) {
+                                callback(redirectUrl);
+                            } else {
+                                response.text().then(t => callback(t));
                             }
-                        }
-                    });
-                    return xhr;
-                };
-            }
-            """
-            
-            js_click = """
-            let btn = document.querySelector('a[hx-post]');
-            if (btn && btn.style.opacity !== '0.5') {
-                btn.click(); // Natively click the button!
-            }
-            return document.body.getAttribute('data-direct-url');
-            """
-            # -------------------------------
+                        }).catch(e => callback("ERROR"));
+                        """
+
+                        drv.set_script_timeout(10)
+                        try:
+                            result = drv.execute_async_script(js_fetch, turnstile_token, post_endpoint)
+                            if result:
+                                if result.startswith("http"):
+                                    return result
+                                else:
+                                    match_url = re.search(r'(https://dl\.fuckingfast\.co/dl/[^\'"]+)', result)
+                                    if match_url:
+                                        return match_url.group(1)
+                        except Exception:
+                            pass
+
+                is_cf_challenge = ("Just a moment" in last_html) or ("challenges.cloudflare.com" in last_html)
+                if is_cf_challenge and not last_token:
+                    captcha_blocked += 1
+                return None
 
             for i, link in enumerate(links, 1):
                 filename = link.split('#')[-1] if '#' in link else link.split('/')[-1]
                 self.root.after(0, self.update_ui, f"Processing [{i}/{total}]: {filename}")
-                
-                try:
-                    driver.get(link)
-                    driver.execute_script(js_inject)
-                    
-                    direct_url = None
-                    for _ in range(30):
-                        time.sleep(1)
-                        
-                        # Click the button and check if our interceptor caught the URL
-                        result = driver.execute_script(js_click)
-                        if result and "dl.fuckingfast.co" in result:
-                            direct_url = result
-                            break
-                            
-                        # Fallback: check if the browser natively navigated to the link
-                        if "dl.fuckingfast.co" in driver.current_url:
-                            direct_url = driver.current_url
-                            break
-                            
-                        # Fallback: Old window.open method
-                        match_old = re.search(r'window\.open\("([^"]+)"\)', driver.page_source)
-                        if match_old:
-                            direct_url = match_old.group(1)
-                            break
-                            
-                    if direct_url:
-                        self.root.after(0, self.update_ui, None, i, None, direct_url)
-                    else:
-                        self.root.after(0, self.update_ui, None, i, None, f"# FAILED: {filename} ({link})")
-                        
-                except Exception as e:
-                    self.root.after(0, self.update_ui, None, i, None, f"# ERROR: {str(e)} -> {filename}")
 
+                for attempt in range(2):
+                    try:
+                        direct_url = extract_one(driver, link, filename)
+                        if direct_url:
+                            resolved_any = True
+                            self.root.after(0, self.update_ui, None, i, None, direct_url)
+                        else:
+                            self.root.after(0, self.update_ui, None, i, None, f"# FAILED: {filename} ({link})")
+                        break
+                    except Exception as e:
+                        if attempt == 0 and session_is_dead(e):
+                            self.root.after(0, self.update_ui, f"Browser closed — relaunching {browser_name}, retrying [{i}/{total}]...")
+                            try:
+                                driver.quit()
+                            except Exception:
+                                pass
+                            driver = create_driver(version=working_version)
+                            continue
+                        self.root.after(0, self.update_ui, None, i, None, f"# ERROR: {str(e)} -> {filename}")
+                        break
+
+                if detectable_browser and captcha_blocked >= 2 and not resolved_any:
+                    self.root.after(0, self.update_ui,
+                        f"Cloudflare is rejecting {browser_name}: the captcha never completes for an automated "
+                        f"{browser_name} window. Use Google Chrome or Brave instead.")
+                    self.root.after(0, self.update_ui, None, None, None,
+                        f"# STOPPED after {i} links: Cloudflare would not verify {browser_name}. "
+                        f"Re-run with Google Chrome or Brave.")
+                    break
             else:
                 self.root.after(0, self.update_ui, f"Extraction complete! Processed {total} links.")
             
         except Exception as e:
-            diag(f"CRITICAL ERROR: {e}", exc=True)
+            print(f"CRITICAL ERROR: {e}")
             self.root.after(0, self.update_ui, f"Critical Error: {str(e)}")
             
         finally:
