@@ -17,6 +17,19 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.action_chains import ActionChains
+import selenium.webdriver.edge.webdriver
+import selenium.webdriver.edge.service
+import selenium.webdriver.edge.options
+from selenium.webdriver.common.driver_finder import DriverFinder
+from selenium.webdriver.edge.service import Service as EdgeService
+from selenium.webdriver.edge.options import Options as EdgeOptions
+from selenium.webdriver.edge.webdriver import WebDriver as EdgeDriver
+import selenium.webdriver.firefox.webdriver
+import selenium.webdriver.firefox.service
+import selenium.webdriver.firefox.options
+from selenium.webdriver.firefox.service import Service as FirefoxService
+from selenium.webdriver.firefox.options import Options as FirefoxOptions
+from selenium.webdriver.firefox.webdriver import WebDriver as FirefoxDriver
 
 FF_LINK_RE = re.compile(
     r"https?://(?:www\.)?fuckingfast\.co/[^\s\"'<>\]]+",
@@ -95,6 +108,39 @@ def decrypt_privatebin_paste(paste_url):
 
     payload = json.loads(plain.decode("utf-8"))
     return payload.get("paste", "")
+
+
+def patch_edge_driver(driver_path):
+    """
+    Patch msedgedriver to neutralize automation indicators (e.g. the cdc_ identifier)
+    that Cloudflare Turnstile uses to detect automated Chromium browsers.
+    """
+    try:
+        driver_dir = os.path.dirname(driver_path)
+        patched_path = os.path.join(driver_dir, "msedgedriver_stealth.exe")
+
+        if os.path.exists(patched_path) and os.path.getsize(patched_path) == os.path.getsize(driver_path):
+            return patched_path
+
+        with open(driver_path, "rb") as f:
+            raw = f.read()
+
+        cdc_block_match = re.search(rb"\{window\.cdc.*?;\}", raw)
+        if cdc_block_match:
+            target = cdc_block_match.group(0)
+            replacement = b'{console.log("edge_stealth");}'.ljust(len(target), b" ")
+            raw = raw.replace(target, replacement)
+
+        for m in set(re.findall(rb"cdc_[a-zA-Z0-9_]{10,}", raw)):
+            new_id = b"edg_" + m[4:]
+            raw = raw.replace(m, new_id)
+
+        with open(patched_path, "wb") as f:
+            f.write(raw)
+        return patched_path
+    except Exception as e:
+        print(f"Warning: Failed to patch Edge driver ({e}), falling back to original driver.")
+        return driver_path
 
 
 class FitgirlExtractorApp:
@@ -602,22 +648,45 @@ class FitgirlExtractorApp:
         
         def create_driver(version=None):
             if browser_name.lower() == 'firefox':
-                from selenium import webdriver
-                from selenium.webdriver.firefox.options import Options
-                opts = Options()
+                opts = FirefoxOptions()
                 opts.binary_location = browser_executable
                 opts.set_preference("dom.webdriver.enabled", False)
-                return webdriver.Firefox(options=opts)
+                return FirefoxDriver(options=opts)
                 
             elif browser_name.lower() == 'msedge':
-                from selenium import webdriver
-                from selenium.webdriver.edge.options import Options
-                opts = Options()
+                opts = EdgeOptions()
                 opts.binary_location = browser_executable
                 opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-                opts.add_experimental_option('useAutomationExtension', False)
+                opts.add_experimental_option("useAutomationExtension", False)
                 opts.add_argument("--disable-blink-features=AutomationControlled")
-                return webdriver.Edge(options=opts)
+                opts.add_argument("--no-first-run")
+                opts.add_argument("--no-default-browser-check")
+
+                service = EdgeService()
+                try:
+                    orig_driver_path = DriverFinder(service, opts).get_driver_path()
+                    if orig_driver_path and os.path.exists(orig_driver_path):
+                        stealth_driver_path = patch_edge_driver(orig_driver_path)
+                        if stealth_driver_path and os.path.exists(stealth_driver_path):
+                            service = EdgeService(executable_path=stealth_driver_path)
+                except Exception as ex:
+                    print(f"Edge stealth driver setup notice: {ex}")
+
+                driver = EdgeDriver(service=service, options=opts)
+                try:
+                    driver.execute_cdp_cmd(
+                        "Page.addScriptToEvaluateOnNewDocument",
+                        {
+                            "source": """
+                                Object.defineProperty(navigator, 'webdriver', {
+                                    get: () => undefined
+                                });
+                            """
+                        },
+                    )
+                except Exception as cdp_err:
+                    print(f"Edge CDP initialization notice: {cdp_err}")
+                return driver
                 
             else:
                 opts = uc.ChromeOptions()
@@ -676,7 +745,7 @@ class FitgirlExtractorApp:
                 else:
                     raise e
 
-            detectable_browser = browser_name.lower() in ('firefox', 'msedge')
+            detectable_browser = browser_name.lower() in ('firefox',)
             captcha_blocked = 0
             resolved_any = False
             if detectable_browser:
