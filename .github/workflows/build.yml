@@ -25,7 +25,7 @@ jobs:
 
     - name: Build EXE with PyInstaller
       run: |
-        pyinstaller --onefile --noconsole --name="FitGirl_FF_Link_Extractor" ff_grabber.py
+        pyinstaller FitGirl_FF_Link_Extractor.spec --clean -y
 
     - name: Upload EXE Artifact
       uses: actions/upload-artifact@v4 # Updated to v4
